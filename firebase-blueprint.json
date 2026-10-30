@@ -1,0 +1,171 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Commercial team member or administrator profile",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 120 },
+        "email": { "type": "string", "maxLength": 120 },
+        "role": { "type": "string", "enum": ["admin", "sales_rep", "manager"] },
+        "avatarUrl": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["uid", "name", "email", "role"]
+    },
+    "Lead": {
+      "title": "Lead",
+      "description": "Sales lead and opportunity in the pipeline",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "email": { "type": "string", "maxLength": 120 },
+        "company": { "type": "string", "maxLength": 120 },
+        "source": { "type": "string", "maxLength": 60 },
+        "stageId": { "type": "string", "maxLength": 64 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "ownerName": { "type": "string", "maxLength": 120 },
+        "value": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 5000 },
+        "tags": { "type": "array" },
+        "consentMessaging": { "type": "boolean" },
+        "consentSource": { "type": "string", "maxLength": 100 },
+        "consentDate": { "type": "string" },
+        "lastContactAt": { "type": "string" },
+        "nextFollowUpAt": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["name", "phone", "stageId", "ownerId"]
+    },
+    "PipelineStage": {
+      "title": "PipelineStage",
+      "description": "Stages in the commercial Kanban funnel",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "maxLength": 60 },
+        "order": { "type": "number" },
+        "color": { "type": "string", "maxLength": 30 },
+        "isWon": { "type": "boolean" },
+        "isLost": { "type": "boolean" }
+      },
+      "required": ["name", "order", "color"]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "WhatsApp chat thread with a contact or lead",
+      "type": "object",
+      "properties": {
+        "phone": { "type": "string", "maxLength": 30 },
+        "contactName": { "type": "string", "maxLength": 120 },
+        "leadId": { "type": "string", "maxLength": 128 },
+        "lastMessage": { "type": "string", "maxLength": 2000 },
+        "lastMessageAt": { "type": "string" },
+        "unreadCount": { "type": "number" },
+        "assignedTo": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "enum": ["open", "closed", "archived"] },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["phone", "contactName", "status"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "WhatsApp individual chat message",
+      "type": "object",
+      "properties": {
+        "conversationId": { "type": "string", "maxLength": 128 },
+        "leadId": { "type": "string", "maxLength": 128 },
+        "externalId": { "type": "string", "maxLength": 128 },
+        "sender": { "type": "string", "enum": ["user", "contact", "system"] },
+        "fromMe": { "type": "boolean" },
+        "body": { "type": "string", "maxLength": 4000 },
+        "status": { "type": "string", "enum": ["sending", "sent", "delivered", "read", "failed"] },
+        "mediaType": { "type": "string", "enum": ["text", "image", "audio", "document"] },
+        "mediaUrl": { "type": "string", "maxLength": 1000 },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["conversationId", "sender", "fromMe", "body", "timestamp"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "Commercial follow-up task or reminder",
+      "type": "object",
+      "properties": {
+        "leadId": { "type": "string", "maxLength": 128 },
+        "leadName": { "type": "string", "maxLength": 120 },
+        "title": { "type": "string", "maxLength": 200 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "dueDate": { "type": "string" },
+        "assignedTo": { "type": "string", "maxLength": 128 },
+        "assignedToName": { "type": "string", "maxLength": 120 },
+        "completed": { "type": "boolean" },
+        "completedAt": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["leadId", "title", "dueDate", "assignedTo"]
+    },
+    "Activity": {
+      "title": "Activity",
+      "description": "Audit and timeline event for lead interactions and Kanban moves",
+      "type": "object",
+      "properties": {
+        "leadId": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "userName": { "type": "string", "maxLength": 120 },
+        "type": { "type": "string", "maxLength": 50 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["leadId", "type", "description", "timestamp"]
+    },
+    "IntegrationSetting": {
+      "title": "IntegrationSetting",
+      "description": "Evolution API and WhatsApp connection status and configuration",
+      "type": "object",
+      "properties": {
+        "status": { "type": "string", "enum": ["disconnected", "connecting", "connected", "error"] },
+        "instanceName": { "type": "string", "maxLength": 100 },
+        "connectedPhone": { "type": "string", "maxLength": 30 },
+        "lastConnectedAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["status", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Team member profiles and permissions"
+    },
+    "/leads/{leadId}": {
+      "schema": "Lead",
+      "description": "Commercial leads and opportunities"
+    },
+    "/pipeline_stages/{stageId}": {
+      "schema": "PipelineStage",
+      "description": "Configurable stages of the sales pipeline"
+    },
+    "/conversations/{conversationId}": {
+      "schema": "Conversation",
+      "description": "WhatsApp conversations with leads and contacts"
+    },
+    "/messages/{messageId}": {
+      "schema": "Message",
+      "description": "WhatsApp chat messages"
+    },
+    "/tasks/{taskId}": {
+      "schema": "Task",
+      "description": "Commercial follow-up tasks and deadlines"
+    },
+    "/activities/{activityId}": {
+      "schema": "Activity",
+      "description": "Historical timeline of changes, notes and messages"
+    },
+    "/integration_settings/{settingId}": {
+      "schema": "IntegrationSetting",
+      "description": "Integration state and non-sensitive status metadata"
+    }
+  }
+}

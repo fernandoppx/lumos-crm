@@ -1,0 +1,6 @@
+{
+  "name": "Lumus CRM",
+  "description": "Plataforma de gestão comercial com pipeline Kanban e atendimento via WhatsApp",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

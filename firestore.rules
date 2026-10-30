@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && (request.auth.uid == userId || !exists(/databases/$(database)/documents/users/$(userId)));
+    }
+
+    match /leads/{leadId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn()
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 30;
+      allow delete: if isSignedIn();
+    }
+
+    match /pipeline_stages/{stageId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+    }
+
+    match /conversations/{conversationId} {
+      allow read, write: if isSignedIn();
+    }
+
+    match /messages/{messageId} {
+      allow read, write: if isSignedIn();
+    }
+
+    match /tasks/{taskId} {
+      allow read, write: if isSignedIn();
+    }
+
+    match /activities/{activityId} {
+      allow read, create, update, delete: if isSignedIn();
+    }
+
+    match /integration_settings/{settingId} {
+      allow read, write: if isSignedIn();
+    }
+  }
+}
