@@ -1,109 +1,55 @@
-# Lumus CRM - Plataforma Comercial & Atendimento WhatsApp
+# LUMOS CRM — Vendas & WhatsApp
 
-Lumus CRM é uma aplicação web full-stack desenvolvida para a gestão comercial interna de equipes de vendas. A aplicação combina pipeline visual no estilo Kanban, cadastro e acompanhamento detalhado de leads, controle de tarefas/follow-ups e uma caixa de entrada para atendimento individual via WhatsApp integrada com a **Evolution API** via QR Code e Webhooks.
+CRM comercial com funil Kanban, leads, tarefas, relatórios e **caixa de entrada com vários números de WhatsApp** (um por vendedor), conectados por QR Code via [Evolution API](https://doc.evolution-api.com/).
 
----
+## Como funciona
 
-## 1. Visão Geral da Arquitetura
+- **Cada vendedor conecta o próprio WhatsApp** em *Números de WhatsApp* (QR Code). Não há limite fixo de números; o padrão é até 10 (`MAX_WHATSAPP_INSTANCES`).
+- As conversas de cada número ficam separadas. Se o mesmo cliente falar com dois vendedores, são duas conversas, cada uma respondida pelo número certo.
+- Conversas novas vão para o dono do número (ou para o dono do lead, quando o telefone já é um lead). Gestores podem transferir.
+- Papéis: **Vendedor** (atende as próprias conversas), **Gestor** (vê e transfere todas, gerencia números), **Administrador** (tudo isso e aprova acessos).
+- Novas contas ficam **aguardando aprovação**. O primeiro usuário a entrar depois da instalação vira administrador.
 
-- **Frontend**: React 19 com TypeScript, Tailwind CSS v4, Lucide Icons e design minimalista para SaaS com foco em legibilidade, `tabular-nums` para valores financeiros e zero elementos poluentes.
-- **Autenticação**: Firebase Authentication com suporte a login com Conta Google e e-mail/senha corporativo.
-- **Banco de Dados**: Cloud Firestore com regras de segurança ativas (`firestore.rules`), subscrições em tempo real (`onSnapshot`) e coleções normalizadas.
-- **Backend / API**: Servidor Express em Node.js integrado ao Vite e empacotado para produção, gerenciando rotas `/api/*`.
-- **Integração WhatsApp**: Adaptador dedicado para **Evolution API** (`src/server/evolutionService.ts`), permitindo checagem de status, solicitação/atualização de QR Code, desconexão, envio de mensagens e endpoint receptor de Webhook idempotente.
+## Arquitetura
 
----
+| Parte | Tecnologia |
+|---|---|
+| Frontend | React 19 + TypeScript + Vite + Tailwind 4 |
+| Login | Firebase Authentication (Google ou e-mail/senha) |
+| Banco | Cloud Firestore (tempo real), regras em `firestore.rules` |
+| Arquivos (fotos, áudios, PDFs) | Firebase Storage |
+| API | Express como função serverless na Vercel (`api/index.ts`) |
+| WhatsApp | Evolution API v2 (uma instância por número) |
 
-## 2. Variáveis de Ambiente (.env)
+Toda rota `/api/*` exige o token de login do Firebase, exceto `/api/health` e o webhook (que exige o segredo `WEBHOOK_SECRET`).
 
-Configure as seguintes variáveis de ambiente no arquivo `.env` (ou no painel de segredos do ambiente):
+### Coleções do Firestore
 
-```env
-# Porta da aplicação (padrão 3000)
-PORT=3000
+- `users` — perfis, papel (`role`) e aprovação (`active`)
+- `whatsapp_instances` — números conectados (gravado só pelo servidor)
+- `conversations` e `conversations/{id}/messages` — atendimento
+- `leads`, `pipeline_stages`, `tasks`, `activities` — comercial
+- `quick_replies` — respostas rápidas da equipe
+- `idempotency_keys`, `webhook_logs` — controle interno do servidor
 
-# URL pública da sua aplicação (usada para autogerar a URL de Webhook)
-APP_URL="https://seu-crm.run.app"
+## Configuração (uma vez)
 
-# Evolution API - Integração WhatsApp
-# URL base onde sua Evolution API está hospedada (ex: https://evolution.suaempresa.com ou http://localhost:8080)
-EVOLUTION_API_URL="https://evolution.suaempresa.com"
+1. **Servidor da Evolution API** sempre ligado (VPS com ~2 GB de RAM atende vários números). Anote a URL e a chave global (`AUTHENTICATION_API_KEY`).
+2. **Variáveis na Vercel** (Settings → Environment Variables), veja `.env.example`:
+   - `EVOLUTION_API_URL`, `EVOLUTION_API_KEY`
+   - `WEBHOOK_SECRET` (texto longo aleatório)
+   - `FIREBASE_SERVICE_ACCOUNT_KEY` (JSON da conta de serviço em uma linha)
+   - `APP_URL` (opcional na Vercel)
+3. **Regras do Firestore**: publique `firestore.rules` (Firebase Console → Firestore → Regras, ou `firebase deploy --only firestore:rules`).
+4. **Firebase Storage** ativado no projeto (para guardar fotos, áudios e documentos).
+5. Faça um novo deploy na Vercel. Entre no CRM: o primeiro acesso vira administrador.
+6. Em *Números de WhatsApp*, cada vendedor clica em **Conectar meu WhatsApp** e lê o QR Code. O webhook é configurado sozinho.
 
-# Chave Global ou de Instância da Evolution API (header apikey)
-EVOLUTION_API_KEY="sua_chave_secreta_aqui"
+## Desenvolvimento
 
-# Nome exato da instância criada na Evolution API
-EVOLUTION_INSTANCE_NAME="lumus-comercial"
-
-# Segredo compartilhado do Webhook (opcional, para validação extra)
-WEBHOOK_SECRET="seu_segredo_webhook"
-```
-
----
-
-## 3. Configuração da Evolution API e Webhook
-
-Para conectar o WhatsApp da sua empresa:
-
-1. **Criação da Instância na Evolution API**:
-   - Crie uma instância com o mesmo nome informado em `EVOLUTION_INSTANCE_NAME`.
-2. **Configuração do Webhook**:
-   - No painel da sua Evolution API (ou via API REST `POST /webhook/set/:instance`), configure a URL:
-     ```
-     https://seu-crm.run.app/api/webhook/evolution
-     ```
-   - Habilite os eventos:
-     - `MESSAGES_UPSERT` (para receber novas mensagens e respostas de clientes)
-     - `CONNECTION_UPDATE` (para atualizar o status de conectado/desconectado em tempo real)
-     - `QRCODE_UPDATED` (para atualizar o QR code se gerado remotamente)
-3. **Validação e Idempotência**:
-   - O backend do Lumus CRM valida os identificadores externos das mensagens (`key.id`) para evitar duplicações de mensagens processadas.
-   - Mensagens enviadas pelo próprio CRM são registradas com status `sent` e ID externo.
-
----
-
-## 4. Banco de Dados e Coleções do Firestore
-
-O Firestore foi provisionado com as seguintes coleções estruturadas:
-
-- `users`: Perfis dos vendedores e administradores.
-- `leads`: Cadastro dos clientes em potencial, contatos, valores, consentimento LGPD e tags.
-- `pipeline_stages`: Etapas do Kanban com ordenação e cores personalizáveis.
-- `conversations`: Linhas de atendimento no WhatsApp associadas a leads ou contatos desconhecidos.
-- `messages`: Mensagens individuais com carimbo de tempo, remetente e status real.
-- `tasks`: Tarefas e follow-ups comerciais com detecção de prazos vencidos.
-- `activities`: Registro cronológico e auditoria de cada movimentação de funil, anotação e mensagem.
-- `integration_settings`: Metadados de conexão do WhatsApp.
-
----
-
-## 5. Como Executar Localmente
-
-### Pré-requisitos
-- Node.js 20+ ou 22+
-- NPM ou Yarn
-
-### Instalação e Execução
 ```bash
-# 1. Instalar dependências
 npm install
-
-# 2. Executar em modo desenvolvimento (Vite + Express API na porta 3000)
-npm run dev
-
-# 3. Compilar projeto para produção
+npm run dev      # Vite + API na porta 3000
+npm test         # testes do webhook e da API
 npm run build
-
-# 4. Iniciar servidor de produção
-npm start
 ```
-
----
-
-## 6. Dados de Demonstração
-
-Por padrão, a aplicação inicia com banco de produção limpo (sem dados fictícios poluindo seu funil). Para testar as funcionalidades comerciais:
-1. Acesse o menu **Configurações**.
-2. Na seção **Dados de Demonstração**, clique em **Gerar Dados de Demonstração**.
-3. O sistema criará 8 leads reais distribuídos nas 8 etapas padrão do funil, com tarefas, histórico e conversas para testes da equipe.
-4. Você pode limpar a base de testes a qualquer momento clicando em **Limpar Todo o Banco**.

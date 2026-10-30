@@ -1,212 +1,104 @@
 /**
- * Suíte de testes automatizados para recebimento, extração,
- * normalização de telefones, idempotência e persistência de mensagens da Evolution API no Lumus CRM.
+ * Testes de unidade da extração de mensagens da Evolution API (v1 e v2).
+ * Rodar: npx tsx src/server/__tests__/webhookPersistence.test.ts
  */
 
-import { extractEvolutionMessage, getPhoneVariants } from '../webhookPersistence.ts';
-import { evolutionService } from '../evolutionService.ts';
+import {
+  extractEvolutionMessage,
+  getPhoneVariants,
+  normalizeEvent,
+  mapAckStatus,
+  conversationIdFor,
+} from '../webhookPersistence.ts';
+import { makeInstanceName, mapRawState } from '../evolutionService.ts';
 
-let passedTests = 0;
-let totalTests = 0;
-
-function assert(condition: boolean, testName: string, details?: any) {
-  totalTests++;
+let passed = 0;
+let total = 0;
+function assert(condition: boolean, name: string, details?: any) {
+  total++;
   if (condition) {
-    passedTests++;
-    console.log(`  ✅ PASS: ${testName}`);
+    passed++;
+    console.log(`  ✅ ${name}`);
   } else {
-    console.error(`  ❌ FAIL: ${testName}`, details || '');
-    throw new Error(`Falha no teste: ${testName}`);
+    console.error(`  ❌ ${name}`, details ?? '');
+    process.exitCode = 1;
   }
 }
 
-async function runTestSuite() {
-  console.log('====================================================');
-  console.log(' INICIANDO TESTES DO WEBHOOK EVOLUTION API NO CRM  ');
-  console.log('====================================================\n');
+console.log('\n▶ Eventos e status');
+assert(normalizeEvent('messages.upsert') === 'MESSAGES_UPSERT', 'v2 "messages.upsert" → MESSAGES_UPSERT');
+assert(normalizeEvent('MESSAGES_UPDATE') === 'MESSAGES_UPDATE', 'v1 MESSAGES_UPDATE mantido');
+assert(normalizeEvent('connection.update') === 'CONNECTION_UPDATE', 'connection.update → CONNECTION_UPDATE');
+assert(normalizeEvent('send.message') === 'SEND_MESSAGE', 'send.message → SEND_MESSAGE');
+assert(mapAckStatus('READ') === 'read' && mapAckStatus(4) === 'read', 'confirmação de leitura');
+assert(mapAckStatus('DELIVERY_ACK') === 'delivered' && mapAckStatus(3) === 'delivered', 'confirmação de entrega');
+assert(mapAckStatus('PENDING') === null, 'status desconhecido ignorado');
+assert(mapRawState('open') === 'connected' && mapRawState('close') === 'disconnected' && mapRawState('connecting') === 'connecting', 'estado da conexão');
 
-  // ----------------------------------------------------
-  // TESTE 1: Extração de Mensagem de Texto Padrão (conversation)
-  // ----------------------------------------------------
-  console.log('--- Teste 1: Formatos de Mensagem ---');
-  const simplePayload = {
-    event: 'messages.upsert',
-    instance: 'lumus-crm',
-    data: {
-      key: {
-        remoteJid: '5511987654321@s.whatsapp.net',
-        fromMe: false,
-        id: 'EVO_MSG_001',
-      },
-      pushName: 'Carlos Silva',
-      message: {
-        conversation: 'Olá! Gostaria de uma cotação para o software.',
-      },
-      messageTimestamp: 1711800000,
-    },
-  };
+console.log('\n▶ Telefones e IDs');
+const v = getPhoneVariants('5512988887777');
+assert(v.includes('+5512988887777') && v.includes('+551288887777'), 'variantes com e sem 9º dígito', v);
+const v2 = getPhoneVariants('551288887777');
+assert(v2.includes('+5512988887777'), 'número de 12 dígitos ganha variante com 9', v2);
+assert(conversationIdFor('lumos-ana-ab12', '+5512988887777') === 'conv_lumos-ana-ab12_5512988887777', 'ID de conversa por número + telefone');
+const name = makeInstanceName('Vendas Ação São João!');
+assert(/^lumos-vendas-acao-sao-joao-[0-9a-f]{6}$/.test(name), 'nome de instância seguro e sem acentos', name);
 
-  const extractedSimple = extractEvolutionMessage(simplePayload);
-  assert(extractedSimple !== null, 'Payload simples deve ser extraído');
-  assert(extractedSimple?.externalId === 'EVO_MSG_001', 'externalId deve ser EVO_MSG_001');
-  assert(extractedSimple?.fromMe === false, 'fromMe deve ser false');
-  assert(extractedSimple?.body === 'Olá! Gostaria de uma cotação para o software.', 'Texto do body extraído corretamente');
-  assert(extractedSimple?.contactName === 'Carlos Silva', 'Nome do contato Carlos Silva');
-  assert(extractedSimple?.isGroup === false, 'Não deve ser grupo');
-  assert(extractedSimple?.isLid === false, 'Não deve ser LID');
-
-  // ----------------------------------------------------
-  // TESTE 2: Mensagem de Texto Estendida (extendedTextMessage)
-  // ----------------------------------------------------
-  const extendedPayload = {
-    data: {
-      key: {
-        remoteJid: '5521998877665@s.whatsapp.net',
-        fromMe: true,
-        id: 'EVO_MSG_EXT_002',
-      },
-      pushName: 'Vendedor Lumus',
-      message: {
-        extendedTextMessage: {
-          text: 'Segue nossa proposta comercial atualizada.',
-        },
-      },
-      messageTimestamp: 1711800010,
-    },
-  };
-
-  const extractedExt = extractEvolutionMessage(extendedPayload);
-  assert(extractedExt !== null, 'Payload estendido deve ser extraído');
-  assert(extractedExt?.externalId === 'EVO_MSG_EXT_002', 'externalId deve ser EVO_MSG_EXT_002');
-  assert(extractedExt?.fromMe === true, 'fromMe deve ser true');
-  assert(extractedExt?.body === 'Segue nossa proposta comercial atualizada.', 'Texto estendido extraído');
-
-  // ----------------------------------------------------
-  // TESTE 3: Mensagens de Mídia (Imagem com Legenda, Áudio, Documento)
-  // ----------------------------------------------------
-  console.log('\n--- Teste 2: Mídias e Botões ---');
-  const imagePayload = {
-    data: {
-      key: { remoteJid: '5511987654321@s.whatsapp.net', fromMe: false, id: 'EVO_IMG_003' },
-      message: {
-        imageMessage: {
-          caption: 'Foto do comprovante de pagamento',
-          url: 'https://example.com/media/recibo.jpg',
-        },
-      },
-    },
-  };
-  const extractedImg = extractEvolutionMessage(imagePayload);
-  assert(extractedImg?.mediaType === 'image', 'Tipo de mídia deve ser image');
-  assert(extractedImg?.body === 'Foto do comprovante de pagamento', 'Legenda da imagem extraída no body');
-  assert(extractedImg?.mediaUrl === 'https://example.com/media/recibo.jpg', 'URL da imagem extraída');
-
-  const audioPayload = {
-    data: {
-      key: { remoteJid: '5511987654321@s.whatsapp.net', fromMe: false, id: 'EVO_AUD_004' },
-      message: {
-        audioMessage: {
-          url: 'https://example.com/audio/voice.ogg',
-        },
-      },
-    },
-  };
-  const extractedAudio = extractEvolutionMessage(audioPayload);
-  assert(extractedAudio?.mediaType === 'audio', 'Tipo de mídia audio');
-  assert(extractedAudio?.body === '[Mensagem de Áudio]', 'Body padrão para áudio');
-
-  // ----------------------------------------------------
-  // TESTE 4: Mensagens de Grupos (@g.us) e Filtro Comercial
-  // ----------------------------------------------------
-  console.log('\n--- Teste 3: Grupos e LIDs ---');
-  const groupPayload = {
-    data: {
-      key: {
-        remoteJid: '120363024849182394@g.us',
-        participant: '5511987654321@s.whatsapp.net',
-        fromMe: false,
-        id: 'EVO_GRP_005',
-      },
-      message: {
-        conversation: 'Mensagem enviada no grupo comercial',
-      },
-    },
-  };
-  const extractedGroup = extractEvolutionMessage(groupPayload);
-  assert(extractedGroup?.isGroup === true, 'Mensagem com @g.us identificada como grupo');
-  assert(extractedGroup?.contactName === 'Grupo WhatsApp', 'Nome padrão para grupo');
-
-  // ----------------------------------------------------
-  // TESTE 5: Identificadores @lid do WhatsApp
-  // ----------------------------------------------------
-  const lidPayload = {
-    data: {
-      key: {
-        remoteJid: '159283748291029@lid',
-        participant: '5511987654321@s.whatsapp.net',
-        fromMe: false,
-        id: 'EVO_LID_006',
-      },
-      message: {
-        conversation: 'Olá via identificador LID',
-      },
-    },
-  };
-  const extractedLid = extractEvolutionMessage(lidPayload);
-  assert(extractedLid?.isLid === true, 'Identificado como @lid');
-  assert(Boolean(extractedLid?.senderPhone?.includes('5511987654321')), 'Extrai telefone do participante real quando remoteJid for @lid');
-
-  // ----------------------------------------------------
-  // TESTE 6: Normalização de Telefones Brasileiros e Variantes do 9º Dígito
-  // ----------------------------------------------------
-  console.log('\n--- Teste 4: Normalização e 9º Dígito Brasileiro ---');
-  const variants13 = getPhoneVariants('+55 11 98765-4321');
-  assert(variants13.length === 2, 'Número BR de 9 dígitos deve gerar 2 variantes (com e sem o 9)');
-  assert(variants13.includes('+5511987654321'), 'Variante com 9 dígitos presente');
-  assert(variants13.includes('+551187654321'), 'Variante legada de 8 dígitos presente');
-
-  const variants12 = getPhoneVariants('551187654321');
-  assert(variants12.length === 2, 'Número BR de 8 dígitos deve gerar 2 variantes');
-  assert(variants12.includes('+551187654321'), 'Variante de 8 dígitos mantida');
-  assert(variants12.includes('+5511987654321'), 'Variante expandida com o 9 presente');
-
-  // ----------------------------------------------------
-  // TESTE 7: Idempotência em Memória e Desduplicação
-  // ----------------------------------------------------
-  console.log('\n--- Teste 5: Idempotência de Mensagens ---');
-  const testMsgId = 'MSG_TEST_IDEMP_' + Date.now();
-  const firstCheck = evolutionService.isMessageAlreadyProcessed(testMsgId);
-  assert(firstCheck === false, 'Primeira ocorrência do ID não deve ser considerada duplicada');
-  const secondCheck = evolutionService.isMessageAlreadyProcessed(testMsgId);
-  assert(secondCheck === true, 'Segunda ocorrência do mesmo ID DEVE ser detectada como duplicada');
-
-  // ----------------------------------------------------
-  // TESTE 8: Validação de Segurança do Webhook (WEBHOOK_SECRET)
-  // ----------------------------------------------------
-  console.log('\n--- Teste 6: Validação de Segurança do Webhook ---');
-  // Se WEBHOOK_SECRET estiver configurado no .env, deve exigir chave válida
-  const secret = process.env.WEBHOOK_SECRET;
-  if (secret) {
-    const validHeader = evolutionService.validateWebhookRequest({ 'x-webhook-secret': secret }, {});
-    assert(validHeader === true, 'Validação com cabeçalho x-webhook-secret correto');
-
-    const validQuery = evolutionService.validateWebhookRequest({}, { secret });
-    assert(validQuery === true, 'Validação com query param secret correto');
-
-    const invalidHeader = evolutionService.validateWebhookRequest({ 'x-webhook-secret': 'chave-incorreta' }, {});
-    assert(invalidHeader === false, 'Rejeição com chave secreta incorreta');
-  } else {
-    // Quando não configurado, permite teste sem bloquear
-    const defaultAuth = evolutionService.validateWebhookRequest({}, {});
-    assert(defaultAuth === true, 'Permite requisição se webhookSecret não estiver configurado');
-  }
-
-  console.log('\n====================================================');
-  console.log(` RESULTADO DOS TESTES: ${passedTests}/${totalTests} PASSARAM COM SUCESSO `);
-  console.log('====================================================\n');
-}
-
-runTestSuite().catch((err) => {
-  console.error('\n❌ ERRO NA EXECUÇÃO DA SUÍTE DE TESTES:', err);
-  process.exit(1);
+console.log('\n▶ Extração de mensagens');
+const text = extractEvolutionMessage({
+  event: 'messages.upsert',
+  instance: 'x',
+  data: {
+    key: { id: 'A1', fromMe: false, remoteJid: '5512988887777@s.whatsapp.net' },
+    pushName: 'Maria',
+    message: { conversation: 'Oi, quero orçamento' },
+    messageTimestamp: 1761850000,
+  },
 });
+assert(text?.body === 'Oi, quero orçamento' && text.senderPhone === '+5512988887777' && text.contactName === 'Maria', 'texto simples', text);
+assert(text?.timestamp === new Date(1761850000 * 1000).toISOString(), 'timestamp em segundos convertido');
+
+const img = extractEvolutionMessage({
+  data: {
+    key: { id: 'A2', fromMe: false, remoteJid: '5512988887777@s.whatsapp.net' },
+    message: { imageMessage: { caption: 'foto', mimetype: 'image/jpeg' }, base64: 'AAAA' },
+  },
+});
+assert(img?.mediaType === 'image' && img.body === 'foto' && img.mediaBase64 === 'AAAA' && img.mediaMime === 'image/jpeg', 'imagem com base64 do webhook', img);
+
+const audio = extractEvolutionMessage({
+  data: { key: { id: 'A3', remoteJid: '5512988887777@s.whatsapp.net' }, message: { audioMessage: { mimetype: 'audio/ogg; codecs=opus' } } },
+});
+assert(audio?.mediaType === 'audio' && audio.body === '', 'áudio sem texto', audio);
+
+const docMsg = extractEvolutionMessage({
+  data: { key: { id: 'A4', remoteJid: '5512988887777@s.whatsapp.net' }, message: { documentMessage: { fileName: 'proposta.pdf', mimetype: 'application/pdf' } } },
+});
+assert(docMsg?.mediaType === 'document' && docMsg.fileName === 'proposta.pdf', 'documento com nome', docMsg);
+
+const lid = extractEvolutionMessage({
+  data: { key: { id: 'A5', remoteJid: '123456789012345@lid', remoteJidAlt: '5511977776666@s.whatsapp.net' }, message: { conversation: 'oi' } },
+});
+assert(lid?.senderPhone === '+5511977776666' && !lid.unresolvedLid, 'contato @lid resolvido pelo remoteJidAlt', lid);
+
+const lidUnknown = extractEvolutionMessage({
+  data: { key: { id: 'A6', remoteJid: '123456789012345@lid' }, message: { conversation: 'oi' } },
+});
+assert(lidUnknown?.unresolvedLid === true && lidUnknown.senderPhone.startsWith('lid:'), 'contato @lid sem telefone fica marcado', lidUnknown);
+
+const group = extractEvolutionMessage({ data: { key: { id: 'A7', remoteJid: '120363@g.us' }, message: { conversation: 'oi' } } });
+assert(group?.isGroup === true, 'grupo detectado');
+
+const eph = extractEvolutionMessage({
+  data: { key: { id: 'A8', remoteJid: '5512988887777@s.whatsapp.net' }, message: { ephemeralMessage: { message: { extendedTextMessage: { text: 'temporária' } } } } },
+});
+assert(eph?.body === 'temporária', 'mensagem temporária desembrulhada', eph);
+
+const mine = extractEvolutionMessage({
+  data: { key: { id: 'A9', fromMe: true, remoteJid: '5512988887777@s.whatsapp.net' }, pushName: 'Vendedor', message: { conversation: 'ok' } },
+});
+assert(mine?.fromMe === true && mine.contactName !== 'Vendedor', 'mensagem enviada pelo celular não troca o nome do cliente', mine);
+
+assert(extractEvolutionMessage({ data: {} }) === null, 'payload sem key.id é rejeitado');
+
+console.log(`\nResultado: ${passed}/${total} testes passaram\n`);

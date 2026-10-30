@@ -12,7 +12,7 @@ import {
   Server,
   Layers,
 } from 'lucide-react';
-import { PipelineStage } from '../../types/crm.ts';
+import { PipelineStage, UserProfile } from '../../types/crm.ts';
 import {
   createStage,
   updateStage,
@@ -20,15 +20,18 @@ import {
   seedDemoData,
   clearAllDemoData,
 } from '../../services/crmService.ts';
+import { TeamSection } from './TeamSection.tsx';
+import { QuickRepliesSection } from './QuickRepliesSection.tsx';
 import { useAuth } from '../../context/AuthContext.tsx';
 import { useToast } from '../common/Toast.tsx';
 
 interface SettingsViewProps {
   stages: PipelineStage[];
+  team: UserProfile[];
 }
 
-export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
-  const { user, profile } = useAuth();
+export const SettingsView: React.FC<SettingsViewProps> = ({ stages, team }) => {
+  const { user, profile, isAdmin, isManager } = useAuth();
   const { success, error, warning } = useToast();
 
   const [newStageName, setNewStageName] = useState('');
@@ -37,6 +40,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
   const [isClearing, setIsClearing] = useState(false);
   const [showSeedConfirm, setShowSeedConfirm] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [clearConfirmText, setClearConfirmText] = useState('');
 
   // Paleta de cores discretas recomendadas para CRM
   const discreteColors = [
@@ -120,6 +124,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
 
   return (
     <div className="space-y-6 max-w-4xl">
+      {isAdmin && <TeamSection team={team} />}
+
+      <QuickRepliesSection />
+
       {/* Etapas do Funil Kanban */}
       <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-xs space-y-5">
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
@@ -158,8 +166,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
               </div>
 
               <div className="flex items-center gap-2">
-                {/* Seletor rápido de cores discretas */}
-                <div className="flex items-center gap-1">
+                {/* Seletor rápido de cores discretas (gestores) */}
+                {isManager && <div className="flex items-center gap-1">
                   {discreteColors.slice(0, 5).map((c) => (
                     <button
                       key={c}
@@ -172,22 +180,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
                       title={`Mudar para cor ${c}`}
                     />
                   ))}
-                </div>
+                </div>}
 
-                <button
+                {isManager && <button
                   onClick={() => handleDeleteStage(stage.id)}
                   title="Excluir etapa"
                   className="p-1.5 text-slate-400 hover:text-rose-600 rounded-md transition-colors ml-2"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                </button>
+                </button>}
               </div>
             </div>
           ))}
         </div>
 
         {/* Formulário para adicionar nova etapa */}
-        <form onSubmit={handleAddStage} className="pt-3 border-t border-slate-100 flex items-center gap-2">
+        {isManager && <form onSubmit={handleAddStage} className="pt-3 border-t border-slate-100 flex items-center gap-2">
           <input
             type="text"
             required
@@ -216,11 +224,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
             <Plus className="w-3.5 h-3.5" />
             <span>Adicionar Etapa</span>
           </button>
-        </form>
+        </form>}
       </div>
 
-      {/* Gestão de Dados de Demonstração (Requisito Seção 13) */}
-      <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-xs space-y-4">
+      {/* Dados de demonstração: somente administradores */}
+      {isAdmin && <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-xs space-y-4">
         <div className="pb-3 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <Database className="w-4 h-4 text-indigo-600" />
@@ -260,7 +268,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
             Limpar Todo o Banco
           </button>
         </div>
-      </div>
+      </div>}
 
       {/* Modal Confirmação Seed */}
       {showSeedConfirm && (
@@ -297,6 +305,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
             <p className="text-xs text-slate-600">
               Esta ação excluirá permanentemente todos os leads, tarefas, conversas e mensagens registradas.
             </p>
+            <p className="text-xs text-slate-600">
+              Para confirmar, digite <strong>APAGAR</strong>:
+            </p>
+            <input
+              value={clearConfirmText}
+              onChange={(e) => setClearConfirmText(e.target.value)}
+              className="w-full text-xs px-3 py-2 border border-rose-200 rounded-lg"
+              placeholder="APAGAR"
+            />
             <div className="flex justify-end gap-2 pt-2">
               <button
                 onClick={() => setShowClearConfirm(false)}
@@ -306,7 +323,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ stages }) => {
               </button>
               <button
                 onClick={handleConfirmClear}
-                disabled={isClearing}
+                disabled={isClearing || clearConfirmText.trim().toUpperCase() !== 'APAGAR'}
                 className="px-3 py-1.5 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-lg disabled:opacity-50"
               >
                 {isClearing ? 'Limpando...' : 'Sim, Limpar Tudo'}

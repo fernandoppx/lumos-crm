@@ -1,17 +1,19 @@
 /**
- * Módulo de persistência transacional e idempotente para webhooks da Evolution API no Lumus CRM.
- * 
- * Requisitos atendidos:
- * - Idempotência atômica por instância e ID externo da mensagem.
- * - Suporte a transações no Firestore com todas as leituras antes das gravações.
- * - Tratamento de contatos desconhecidos, grupos (@g.us) e identificadores @lid.
- * - Normalização de telefones brasileiros e correspondência inteligente com leads existentes.
- * - Preservação dos modelos de dados (messages, conversations, leads, activities).
- * - Prevenção de duplicação para mensagens fromMe=true enviadas pelo CRM.
+ * Persistência dos eventos da Evolution API no Firestore, por número (instância).
+ *
+ * - Cada número de WhatsApp tem suas próprias conversas: ID determinístico
+ *   `conv_<instância>_<telefone>`. O mesmo cliente falando com dois vendedores
+ *   gera duas conversas separadas, cada uma respondida pelo número certo.
+ * - Mensagens ficam em `conversations/{id}/messages` (consulta ordenada sem índice composto).
+ * - Idempotência atômica por instância + ID externo da mensagem.
+ * - Mídias (imagem, áudio, vídeo, documento) são salvas no Firebase Storage.
  */
 
-import { getAdminFirestore, FieldValue } from './firebaseAdmin.ts';
+import crypto from 'crypto';
+import { getAdminFirestore, getAdminBucket, FieldValue } from './firebaseAdmin.ts';
 import { normalizePhone, formatPhoneDisplay } from '../utils/formatters.ts';
+
+export type MediaKind = 'text' | 'image' | 'audio' | 'video' | 'document' | 'sticker';
 
 export interface WebhookMessageExtraction {
   externalId: string;
@@ -20,76 +22,106 @@ export interface WebhookMessageExtraction {
   senderPhone: string;
   contactName: string;
   body: string;
-  mediaType: 'text' | 'image' | 'audio' | 'document';
-  mediaUrl?: string;
+  mediaType: MediaKind;
+  mediaMime?: string;
+  fileName?: string;
+  mediaBase64?: string;
   timestamp: string;
   isGroup: boolean;
   isLid: boolean;
+  /** true quando era @lid e não veio o telefone real */
+  unresolvedLid: boolean;
+}
+
+export interface InstanceRef {
+  id: string;
+  label: string;
+  ownerId: string | null;
+  ownerName: string | null;
+}
+
+/** "messages.upsert" (v2) e "MESSAGES_UPSERT" (v1) viram "MESSAGES_UPSERT". */
+export function normalizeEvent(raw: unknown): string {
+  return String(raw || 'UNKNOWN')
+    .trim()
+    .toUpperCase()
+    .replace(/[.\-\s]+/g, '_');
+}
+
+export function conversationIdFor(instanceId: string, phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  const safeInstance = instanceId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `conv_${safeInstance}_${digits}`;
 }
 
 /**
- * Normaliza número brasileiro considerando variações do 9º dígito (DDD + 8 ou 9 dígitos)
+ * Variações de um número brasileiro (com e sem o 9º dígito).
  */
 export function getPhoneVariants(rawPhone: string): string[] {
   const normalized = normalizePhone(rawPhone);
   if (!normalized) return [];
-
   const digits = normalized.replace(/\D/g, '');
   const variants = new Set<string>([normalized]);
-
-  // Se é número brasileiro (DDI 55)
   if (digits.startsWith('55')) {
     const ddd = digits.slice(2, 4);
     const rest = digits.slice(4);
-
-    // Se tem 13 dígitos no total (55 + DDD + 9 dígitos), cria variante sem o 9º dígito se começar com 9
     if (digits.length === 13 && rest.startsWith('9')) {
-      const eightDigit = `+55${ddd}${rest.slice(1)}`;
-      variants.add(eightDigit);
-    }
-    // Se tem 12 dígitos no total (55 + DDD + 8 dígitos), cria variante adicionando o 9 na frente
-    else if (digits.length === 12) {
-      const nineDigit = `+55${ddd}9${rest}`;
-      variants.add(nineDigit);
+      variants.add(`+55${ddd}${rest.slice(1)}`);
+    } else if (digits.length === 12) {
+      variants.add(`+55${ddd}9${rest}`);
     }
   }
-
   return Array.from(variants);
 }
 
+function jidToPhone(jid: unknown): string {
+  return String(jid || '')
+    .replace(/@.+$/, '')
+    .replace(/:\d+$/, '');
+}
+
 /**
- * Extrai dados padronizados do payload da Evolution API
+ * Extrai dados padronizados do payload da Evolution API (v1 e v2).
  */
 export function extractEvolutionMessage(payload: any): WebhookMessageExtraction | null {
   if (!payload) return null;
 
   const data = Array.isArray(payload.data) ? payload.data[0] : payload.data || payload;
   const key = data?.key || payload?.key;
-
   if (!key || !key.id) return null;
 
   const externalId = String(key.id);
   const fromMe = key.fromMe === true;
   const remoteJid = String(key.remoteJid || data?.remoteJid || '');
-
   const isGroup = remoteJid.endsWith('@g.us');
   const isLid = remoteJid.endsWith('@lid');
 
-  // Identifica telefone real do remetente
-  let rawPhone = remoteJid.replace(/@.+$/, '');
-  if (isLid && (key.participant || data.participant)) {
-    rawPhone = String(key.participant || data.participant).replace(/@.+$/, '');
+  let rawPhone = jidToPhone(remoteJid);
+  let unresolvedLid = false;
+  if (isLid) {
+    // Contatos com identificador "@lid": a Evolution v2 envia o telefone real em campos alternativos.
+    const alt =
+      key.remoteJidAlt || key.senderPn || data?.senderPn || key.participantAlt || data?.remoteJidAlt || '';
+    if (alt && !String(alt).endsWith('@lid')) {
+      rawPhone = jidToPhone(alt);
+    } else {
+      unresolvedLid = true;
+    }
   }
 
-  const senderPhone = isGroup ? remoteJid : normalizePhone(rawPhone) || rawPhone;
-  const pushName = data?.pushName || payload?.pushName || '';
-  const contactName = pushName.trim() || (isGroup ? 'Grupo WhatsApp' : formatPhoneDisplay(senderPhone));
+  const senderPhone = isGroup ? remoteJid : unresolvedLid ? `lid:${rawPhone}` : normalizePhone(rawPhone) || rawPhone;
+  const pushName = String(data?.pushName || payload?.pushName || '').trim();
+  const contactName =
+    (!fromMe && pushName) || (isGroup ? 'Grupo WhatsApp' : unresolvedLid ? 'Contato WhatsApp' : formatPhoneDisplay(senderPhone));
 
-  // Extrai texto de múltiplos formatos suportados pela Evolution API
-  const msgObj = data?.message || payload?.message || {};
+  let msgObj = data?.message || payload?.message || {};
+  // Mensagens efêmeras / "ver uma vez" vêm embrulhadas
+  msgObj = msgObj.ephemeralMessage?.message || msgObj.viewOnceMessage?.message || msgObj.viewOnceMessageV2?.message || msgObj;
+
   let body = '';
-  let mediaType: 'text' | 'image' | 'audio' | 'document' = 'text';
-  let mediaUrl: string | undefined = undefined;
+  let mediaType: MediaKind = 'text';
+  let mediaMime: string | undefined;
+  let fileName: string | undefined;
 
   if (typeof msgObj.conversation === 'string') {
     body = msgObj.conversation;
@@ -97,32 +129,47 @@ export function extractEvolutionMessage(payload: any): WebhookMessageExtraction 
     body = msgObj.extendedTextMessage.text;
   } else if (msgObj.imageMessage) {
     mediaType = 'image';
-    body = msgObj.imageMessage.caption || '[Imagem]';
-    mediaUrl = msgObj.imageMessage.url;
+    body = msgObj.imageMessage.caption || '';
+    mediaMime = msgObj.imageMessage.mimetype;
+  } else if (msgObj.videoMessage) {
+    mediaType = 'video';
+    body = msgObj.videoMessage.caption || '';
+    mediaMime = msgObj.videoMessage.mimetype;
   } else if (msgObj.audioMessage) {
     mediaType = 'audio';
-    body = '[Mensagem de Áudio]';
-    mediaUrl = msgObj.audioMessage.url;
-  } else if (msgObj.documentMessage) {
+    mediaMime = msgObj.audioMessage.mimetype;
+  } else if (msgObj.documentMessage || msgObj.documentWithCaptionMessage) {
+    const doc = msgObj.documentMessage || msgObj.documentWithCaptionMessage?.message?.documentMessage || {};
     mediaType = 'document';
-    body = msgObj.documentMessage.fileName || msgObj.documentMessage.caption || '[Documento]';
-    mediaUrl = msgObj.documentMessage.url;
+    fileName = doc.fileName || doc.title || 'documento';
+    body = doc.caption || '';
+    mediaMime = doc.mimetype;
+  } else if (msgObj.stickerMessage) {
+    mediaType = 'sticker';
+    mediaMime = msgObj.stickerMessage.mimetype || 'image/webp';
   } else if (msgObj.buttonsResponseMessage?.selectedDisplayText) {
     body = msgObj.buttonsResponseMessage.selectedDisplayText;
   } else if (msgObj.listResponseMessage?.title) {
     body = msgObj.listResponseMessage.title;
+  } else if (msgObj.reactionMessage) {
+    body = `Reagiu com ${msgObj.reactionMessage.text || 'um emoji'}`;
+  } else if (msgObj.locationMessage) {
+    const l = msgObj.locationMessage;
+    body = `📍 Localização: https://maps.google.com/?q=${l.degreesLatitude},${l.degreesLongitude}`;
+  } else if (msgObj.contactMessage) {
+    body = `👤 Contato compartilhado: ${msgObj.contactMessage.displayName || ''}`;
   } else if (data?.body) {
     body = String(data.body);
   }
 
-  // Timestamp
+  const mediaBase64: string | undefined = msgObj.base64 || data?.message?.base64 || data?.base64 || undefined;
+
   let timestamp = new Date().toISOString();
   const rawTimestamp = data?.messageTimestamp || payload?.messageTimestamp;
   if (rawTimestamp) {
-    const ms = typeof rawTimestamp === 'number' && rawTimestamp < 10000000000 ? rawTimestamp * 1000 : Number(rawTimestamp);
-    if (!isNaN(ms)) {
-      timestamp = new Date(ms).toISOString();
-    }
+    const n = Number(rawTimestamp);
+    const ms = n < 10000000000 ? n * 1000 : n;
+    if (!isNaN(ms)) timestamp = new Date(ms).toISOString();
   }
 
   return {
@@ -131,29 +178,97 @@ export function extractEvolutionMessage(payload: any): WebhookMessageExtraction 
     remoteJid,
     senderPhone,
     contactName,
-    body: body.trim() || (fromMe ? 'Mensagem enviada' : 'Mensagem recebida'),
+    body: body.trim(),
     mediaType,
-    mediaUrl,
+    mediaMime,
+    fileName,
+    mediaBase64,
     timestamp,
     isGroup,
     isLid,
+    unresolvedLid,
   };
 }
 
+export function mediaPlaceholder(type: MediaKind, fileName?: string): string {
+  switch (type) {
+    case 'image':
+      return '📷 Imagem';
+    case 'audio':
+      return '🎤 Áudio';
+    case 'video':
+      return '🎬 Vídeo';
+    case 'document':
+      return `📄 ${fileName || 'Documento'}`;
+    case 'sticker':
+      return 'Figurinha';
+    default:
+      return 'Mensagem';
+  }
+}
+
+function extensionFor(mime: string | undefined, type: MediaKind): string {
+  const m = (mime || '').split(';')[0].trim();
+  const map: Record<string, string> = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'audio/webm': 'webm',
+    'video/mp4': 'mp4',
+    'application/pdf': 'pdf',
+  };
+  if (map[m]) return map[m];
+  return type === 'audio' ? 'ogg' : type === 'image' ? 'jpg' : type === 'video' ? 'mp4' : 'bin';
+}
+
 /**
- * Persiste a mensagem no Firestore com controle transacional e idempotência
+ * Salva um arquivo (base64) no Firebase Storage e devolve uma URL de download.
+ * Retorna null se o Storage não estiver disponível — a mensagem é gravada mesmo assim.
+ */
+export async function storeMediaFile(
+  folder: string,
+  name: string,
+  base64: string,
+  mime: string | undefined,
+  type: MediaKind
+): Promise<string | null> {
+  try {
+    const clean = base64.replace(/^data:[^;]+;base64,/, '');
+    const buffer = Buffer.from(clean, 'base64');
+    if (!buffer.length || buffer.length > 20 * 1024 * 1024) return null;
+    const bucket = getAdminBucket();
+    const path = `whatsapp-media/${folder}/${name.replace(/[^a-zA-Z0-9_.-]/g, '_')}.${extensionFor(mime, type)}`;
+    const token = crypto.randomUUID();
+    await bucket.file(path).save(buffer, {
+      resumable: false,
+      metadata: {
+        contentType: (mime || 'application/octet-stream').split(';')[0],
+        metadata: { firebaseStorageDownloadTokens: token },
+      },
+    });
+    return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(path)}?alt=media&token=${token}`;
+  } catch (err: any) {
+    console.warn('[Media Storage Warning]:', err?.message || err);
+    return null;
+  }
+}
+
+export type PersistStatus = 'processed' | 'ignored_duplicate' | 'ignored_group' | 'error';
+
+/**
+ * Persiste uma mensagem recebida/enviada com controle transacional e idempotência.
+ * `mediaUrl` já deve vir resolvida (o download/armazenamento acontece fora da transação).
  */
 export async function persistWebhookMessage(
   payload: any,
-  instanceName: string
-): Promise<{
-  success: boolean;
-  status: 'processed' | 'ignored_duplicate' | 'ignored_group' | 'error';
-  externalId?: string;
-  conversationId?: string;
-  error?: string;
-}> {
-  const extracted = extractEvolutionMessage(payload);
+  instance: InstanceRef,
+  options: { mediaUrl?: string | null; extracted?: WebhookMessageExtraction | null } = {}
+): Promise<{ success: boolean; status: PersistStatus; externalId?: string; conversationId?: string; error?: string }> {
+  const extracted = options.extracted ?? extractEvolutionMessage(payload);
   if (!extracted) {
     return {
       success: false,
@@ -162,219 +277,182 @@ export async function persistWebhookMessage(
     };
   }
 
-  const { externalId, fromMe, senderPhone, contactName, body, mediaType, mediaUrl, timestamp, isGroup } = extracted;
+  const { externalId, fromMe, senderPhone, contactName, mediaType, mediaMime, fileName, timestamp, isGroup } = extracted;
+  if (isGroup) return { success: true, status: 'ignored_group', externalId };
 
-  // Se for grupo de WhatsApp (@g.us), ignorar para atendimento individual comercial
-  if (isGroup) {
-    return {
-      success: true,
-      status: 'ignored_group',
-      externalId,
-    };
-  }
+  const body = extracted.body || mediaPlaceholder(mediaType, fileName);
+  const preview = mediaType !== 'text' && extracted.body ? `${mediaPlaceholder(mediaType, fileName)}: ${extracted.body}` : body;
 
   const { db, error: adminError } = getAdminFirestore();
-  if (!db || adminError) {
-    // Retorna erro estruturado informando a indisponibilidade do banco
-    return {
-      success: false,
-      status: 'error',
-      externalId,
-      error: adminError || 'Firebase Admin não pôde ser inicializado.',
-    };
+  if (!db) {
+    return { success: false, status: 'error', externalId, error: adminError || 'Banco indisponível.' };
   }
 
-  const idempotencyKey = `${instanceName}_${externalId}`;
-  const idempRef = db.collection('idempotency_keys').doc(idempotencyKey);
+  const idempRef = db.collection('idempotency_keys').doc(`${instance.id}_${externalId}`.replace(/\//g, '_'));
 
   try {
-    const result = await db.runTransaction(async (transaction) => {
-      // 1. LEITURA 1: Idempotência atômica
-      const idempSnap = await transaction.get(idempRef);
+    const result = await db.runTransaction(async (tx) => {
+      // 1. Idempotência
+      const idempSnap = await tx.get(idempRef);
       if (idempSnap.exists) {
-        return {
-          status: 'ignored_duplicate' as const,
-          externalId,
-        };
+        return { status: 'ignored_duplicate' as const, conversationId: (idempSnap.data() as any)?.conversationId };
       }
 
-      // 2. LEITURA 2: Verifica se mensagem já existe no banco por externalId
-      // (Protege contra mensagens fromMe gravadas anteriormente pelo CRM)
-      const existingMsgQuery = db.collection('messages').where('externalId', '==', externalId).limit(1);
-      const existingMsgSnap = await transaction.get(existingMsgQuery);
-      if (!existingMsgSnap.empty) {
-        // Marca na idempotência e encerra sem duplicar
-        transaction.set(idempRef, {
-          instanceName,
-          externalId,
-          type: fromMe ? 'sent_by_crm' : 'duplicate_existing',
-          processedAt: new Date().toISOString(),
-        });
-        return {
-          status: 'ignored_duplicate' as const,
-          externalId,
-        };
-      }
-
-      // 3. LEITURA 3: Busca conversa existente pelos telefones (variantes de DDD e 9º dígito)
-      const phoneVariants = getPhoneVariants(senderPhone);
-      let existingConvDoc: FirebaseFirestore.DocumentSnapshot | null = null;
-
-      for (const phone of phoneVariants) {
-        const convQuery = db.collection('conversations').where('phone', '==', phone).limit(1);
-        const convSnap = await transaction.get(convQuery);
-        if (!convSnap.empty) {
-          existingConvDoc = convSnap.docs[0];
+      // 2. Conversa existente (por ID determinístico, testando variações do 9º dígito)
+      const variants = senderPhone.startsWith('lid:') ? [senderPhone] : getPhoneVariants(senderPhone);
+      let convSnap: FirebaseFirestore.DocumentSnapshot | null = null;
+      for (const phone of variants) {
+        const snap = await tx.get(db.collection('conversations').doc(conversationIdFor(instance.id, phone)));
+        if (snap.exists) {
+          convSnap = snap;
           break;
         }
       }
 
-      // 4. LEITURA 4: Busca se existe Lead correspondente caso a conversa não tenha leadId
-      let matchedLeadDoc: FirebaseFirestore.DocumentSnapshot | null = null;
-      let matchedLeadId: string | null = (existingConvDoc?.data() as any)?.leadId || null;
-
-      if (!matchedLeadId) {
-        for (const phone of phoneVariants) {
-          const leadQuery = db.collection('leads').where('phone', '==', phone).limit(1);
-          const leadSnap = await transaction.get(leadQuery);
-          if (!leadSnap.empty) {
-            matchedLeadDoc = leadSnap.docs[0];
-            matchedLeadId = matchedLeadDoc.id;
+      // 3. Lead correspondente
+      let leadSnap: FirebaseFirestore.DocumentSnapshot | null = null;
+      const convLeadId = (convSnap?.data() as any)?.leadId || null;
+      if (convLeadId) {
+        const s = await tx.get(db.collection('leads').doc(convLeadId));
+        if (s.exists) leadSnap = s;
+      } else if (!senderPhone.startsWith('lid:')) {
+        for (const phone of variants) {
+          const q = await tx.get(db.collection('leads').where('phone', '==', phone).limit(1));
+          if (!q.empty) {
+            leadSnap = q.docs[0];
             break;
           }
         }
-      } else {
-        const leadRef = db.collection('leads').doc(matchedLeadId);
-        matchedLeadDoc = await transaction.get(leadRef);
       }
+      const lead = (leadSnap?.data() as any) || null;
+      const leadId = leadSnap?.id || null;
 
-      // --- TODAS AS LEITURAS FORAM CONCLUÍDAS. INICIANDO GRAVAÇÕES ATÔMICAS ---
+      // --- gravações ---
+      const convRef = convSnap ? convSnap.ref : db.collection('conversations').doc(conversationIdFor(instance.id, variants[0] || senderPhone));
+      const msgRef = convRef.collection('messages').doc();
 
-      // A. Grava chave de idempotência
-      transaction.set(idempRef, {
-        instanceName,
+      tx.set(idempRef, {
+        instanceId: instance.id,
         externalId,
         fromMe,
-        phone: senderPhone,
+        conversationId: convRef.id,
+        messagePath: msgRef.path,
         processedAt: new Date().toISOString(),
       });
 
-      // B. Resolve ou Cria a Conversa
-      let convRef: FirebaseFirestore.DocumentReference;
-      let conversationId: string;
-      const leadData = matchedLeadDoc?.data() as any;
-
-      if (existingConvDoc && existingConvDoc.exists) {
-        convRef = existingConvDoc.ref;
-        conversationId = existingConvDoc.id;
-        const currentData = existingConvDoc.data() as any;
-
-        // Atualização da conversa existente
-        const convUpdates: Record<string, any> = {
-          lastMessage: body,
+      if (convSnap) {
+        const current = convSnap.data() as any;
+        const updates: Record<string, any> = {
+          lastMessage: preview,
           lastMessageAt: timestamp,
+          lastMessageFromMe: fromMe,
           updatedAt: timestamp,
-        };
-
-        // Incrementa não lidas se recebida de cliente
-        if (!fromMe) {
-          convUpdates.unreadCount = FieldValue.increment(1);
-        }
-
-        // Se encontrou lead e conversa não tinha leadId
-        if (!currentData?.leadId && matchedLeadId) {
-          convUpdates.leadId = matchedLeadId;
-          if (leadData?.name) {
-            convUpdates.contactName = leadData.name;
-          }
-        }
-
-        transaction.update(convRef, convUpdates);
-      } else {
-        // Cria nova conversa com ID determinístico baseado no telefone
-        const cleanDigits = senderPhone.replace(/\D/g, '');
-        convRef = db.collection('conversations').doc(`conv_${cleanDigits || externalId}`);
-        conversationId = convRef.id;
-
-        const newConvData = {
-          phone: senderPhone,
-          contactName: leadData?.name || contactName || formatPhoneDisplay(senderPhone),
-          leadId: matchedLeadId || null,
-          lastMessage: body,
-          lastMessageAt: timestamp,
-          unreadCount: fromMe ? 0 : 1,
-          assignedTo: leadData?.ownerId || null,
           status: 'open',
-          updatedAt: timestamp,
         };
-
-        transaction.set(convRef, newConvData);
+        if (!fromMe) updates.unreadCount = FieldValue.increment(1);
+        if (!current?.leadId && leadId) {
+          updates.leadId = leadId;
+          if (lead?.name) updates.contactName = lead.name;
+        } else if (!fromMe && !current?.leadId && contactName && current?.contactName !== contactName && /^\+?\d/.test(current?.contactName || '')) {
+          // Nome real do contato chegou depois: substitui o número exibido
+          updates.contactName = contactName;
+        }
+        if (!current?.assignedTo) {
+          updates.assignedTo = lead?.ownerId || instance.ownerId || null;
+          updates.assignedToName = lead?.ownerName || instance.ownerName || null;
+        }
+        tx.update(convRef, updates);
+      } else {
+        tx.set(convRef, {
+          phone: variants[0] || senderPhone,
+          contactName: lead?.name || contactName || formatPhoneDisplay(senderPhone),
+          leadId,
+          instanceId: instance.id,
+          instanceLabel: instance.label,
+          lastMessage: preview,
+          lastMessageAt: timestamp,
+          lastMessageFromMe: fromMe,
+          unreadCount: fromMe ? 0 : 1,
+          assignedTo: lead?.ownerId || instance.ownerId || null,
+          assignedToName: lead?.ownerName || instance.ownerName || null,
+          status: 'open',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
       }
 
-      // C. Grava Mensagem
-      const msgRef = db.collection('messages').doc();
-      const messageData = {
-        conversationId,
-        leadId: matchedLeadId || null,
+      tx.set(msgRef, {
+        conversationId: convRef.id,
+        instanceId: instance.id,
+        leadId,
         externalId,
         sender: fromMe ? 'user' : 'contact',
         fromMe,
         body,
         status: fromMe ? 'sent' : 'delivered',
         mediaType,
-        mediaUrl: mediaUrl || null,
+        mediaUrl: options.mediaUrl || null,
+        mediaMime: mediaMime || null,
+        fileName: fileName || null,
+        senderName: fromMe ? 'Celular' : null,
         timestamp,
-      };
-      transaction.set(msgRef, messageData);
+      });
 
-      // D. Se associada a um Lead, atualiza lastContactAt e adiciona Activity de auditoria
-      if (matchedLeadId && matchedLeadDoc && matchedLeadDoc.exists) {
-        const leadRef = db.collection('leads').doc(matchedLeadId);
-        transaction.update(leadRef, {
-          lastContactAt: timestamp,
-          updatedAt: timestamp,
-        });
-
-        const actRef = db.collection('activities').doc();
-        const activityData = {
-          leadId: matchedLeadId,
-          userId: leadData?.ownerId || 'system',
-          userName: fromMe ? (leadData?.ownerName || 'Vendedor') : (leadData?.name || contactName),
+      if (leadId) {
+        tx.update(db.collection('leads').doc(leadId), { lastContactAt: timestamp, updatedAt: timestamp });
+        tx.set(db.collection('activities').doc(), {
+          leadId,
+          userId: lead?.ownerId || 'system',
+          userName: fromMe ? instance.ownerName || 'Vendedor' : lead?.name || contactName,
           type: fromMe ? 'whatsapp_sent' : 'whatsapp_received',
-          description: fromMe
-            ? `Mensagem enviada por WhatsApp: "${body.slice(0, 60)}${body.length > 60 ? '...' : ''}"`
-            : `Mensagem recebida por WhatsApp: "${body.slice(0, 60)}${body.length > 60 ? '...' : ''}"`,
-          metadata: {
-            externalId,
-            conversationId,
-            fromMe,
-          },
+          description: `${fromMe ? 'Mensagem enviada' : 'Mensagem recebida'} por WhatsApp (${instance.label}): "${preview.slice(0, 60)}${preview.length > 60 ? '...' : ''}"`,
+          metadata: { externalId, conversationId: convRef.id, instanceId: instance.id, fromMe },
           timestamp,
-        };
-        transaction.set(actRef, activityData);
+        });
       }
 
-      return {
-        status: 'processed' as const,
-        externalId,
-        conversationId,
-      };
+      return { status: 'processed' as const, conversationId: convRef.id };
     });
 
-    return {
-      success: true,
-      status: result.status,
-      externalId: result.externalId,
-      conversationId: result.conversationId,
-    };
+    return { success: true, status: result.status, externalId, conversationId: result.conversationId };
   } catch (err: any) {
-    const msg = err.message || String(err);
+    const msg = err?.message || String(err);
     console.error('[WebhookPersistence Error]:', msg);
-    return {
-      success: false,
-      status: 'error',
-      externalId,
-      error: msg,
-    };
+    return { success: false, status: 'error', externalId, error: msg };
   }
+}
+
+/** Mapeia o status de entrega (MESSAGES_UPDATE) para o status do CRM. */
+export function mapAckStatus(raw: unknown): 'sent' | 'delivered' | 'read' | null {
+  const s = String(raw ?? '').toUpperCase();
+  if (s === 'READ' || s === 'PLAYED' || s === '4' || s === '5') return 'read';
+  if (s === 'DELIVERY_ACK' || s === '3') return 'delivered';
+  if (s === 'SERVER_ACK' || s === '2') return 'sent';
+  return null;
+}
+
+const STATUS_RANK: Record<string, number> = { sending: 0, failed: 0, sent: 1, delivered: 2, read: 3 };
+
+/** Atualiza ✓ / ✓✓ / lido de uma mensagem enviada. */
+export async function updateMessageStatus(instanceId: string, payload: any): Promise<boolean> {
+  const { db } = getAdminFirestore();
+  if (!db) return false;
+  const items = Array.isArray(payload?.data) ? payload.data : [payload?.data || payload];
+  let updated = false;
+  for (const d of items) {
+    const externalId = d?.keyId || d?.key?.id || d?.id;
+    const status = mapAckStatus(d?.status ?? d?.update?.status);
+    if (!externalId || !status) continue;
+    const idemp = await db.collection('idempotency_keys').doc(`${instanceId}_${externalId}`.replace(/\//g, '_')).get();
+    const path = (idemp.data() as any)?.messagePath;
+    if (!path) continue;
+    const ref = db.doc(path);
+    const snap = await ref.get();
+    const current = (snap.data() as any)?.status || 'sent';
+    if ((STATUS_RANK[status] ?? 0) > (STATUS_RANK[current] ?? 0)) {
+      await ref.update({ status });
+      updated = true;
+    }
+  }
+  return updated;
 }

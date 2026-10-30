@@ -1,55 +1,147 @@
 rules_version = '2';
+
+// Regras do Lumos CRM
+// - Só usuários com conta ATIVA (aprovada por um administrador) acessam os dados.
+// - Contas antigas, criadas antes desta versão (sem o campo "active"), continuam ativas.
+// - Ninguém altera o próprio papel; só administradores aprovam, desativam e mudam papéis.
+// - Números de WhatsApp, chaves de idempotência e logs são gravados apenas pelo servidor.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Global Default-deny catch-all
+
     match /{document=**} {
       allow read, write: if false;
     }
 
-    function isSignedIn() {
+    function signedIn() {
       return request.auth != null;
     }
 
-    function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
     }
 
+    function hasProfile() {
+      return signedIn() && exists(userPath(request.auth.uid));
+    }
+
+    function me() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function isActive() {
+      return hasProfile() && me().get('active', true) == true;
+    }
+
+    function role() {
+      return me().get('role', 'sales_rep');
+    }
+
+    function isAdmin() {
+      return isActive() && role() == 'admin';
+    }
+
+    function isManager() {
+      return isActive() && (role() == 'admin' || role() == 'manager');
+    }
+
+    function bootstrapPath() {
+      return /databases/$(database)/documents/settings/bootstrap;
+    }
+
+    // O primeiro usuário a "reivindicar" o sistema vira administrador (uma única vez).
+    function isBootstrapAdmin() {
+      return existsAfter(bootstrapPath()) && getAfter(bootstrapPath()).data.adminUid == request.auth.uid;
+    }
+
+    function unchanged(field) {
+      return request.resource.data.get(field, null) == resource.data.get(field, null);
+    }
+
+    // ---------------- Usuários ----------------
     match /users/{userId} {
-      allow read: if isSignedIn();
-      allow write: if isSignedIn() && (request.auth.uid == userId || !exists(/databases/$(database)/documents/users/$(userId)));
+      allow read: if isActive() || (signedIn() && request.auth.uid == userId);
+
+      allow create: if signedIn() && request.auth.uid == userId
+        && request.resource.data.uid == userId
+        && (
+          (request.resource.data.role == 'sales_rep' && request.resource.data.active == false)
+          || (request.resource.data.role == 'admin' && request.resource.data.active == true && isBootstrapAdmin())
+        );
+
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == userId && unchanged('role') && unchanged('active') && unchanged('uid'))
+        || (signedIn() && request.auth.uid == userId && request.resource.data.role == 'admin'
+            && request.resource.data.active == true && isBootstrapAdmin());
+
+      allow delete: if isAdmin();
     }
 
+    match /settings/bootstrap {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.adminUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ---------------- Comercial ----------------
     match /leads/{leadId} {
-      allow read: if isSignedIn();
-      allow create, update: if isSignedIn()
+      allow read: if isActive();
+      allow create, update: if isActive()
         && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
         && request.resource.data.phone is string && request.resource.data.phone.size() <= 30;
-      allow delete: if isSignedIn();
+      allow delete: if isManager() || (isActive() && resource.data.ownerId == request.auth.uid);
     }
 
     match /pipeline_stages/{stageId} {
-      allow read: if isSignedIn();
-      allow write: if isSignedIn();
-    }
-
-    match /conversations/{conversationId} {
-      allow read, write: if isSignedIn();
-    }
-
-    match /messages/{messageId} {
-      allow read, write: if isSignedIn();
+      allow read: if isActive();
+      allow create: if isActive();
+      allow update, delete: if isManager();
     }
 
     match /tasks/{taskId} {
-      allow read, write: if isSignedIn();
+      allow read, create, update: if isActive();
+      allow delete: if isManager() || (isActive() && resource.data.assignedTo == request.auth.uid);
     }
 
     match /activities/{activityId} {
-      allow read, create, update, delete: if isSignedIn();
+      allow read, create: if isActive();
+      allow update, delete: if isAdmin();
+    }
+
+    // ---------------- WhatsApp ----------------
+    match /conversations/{conversationId} {
+      allow read, create, update: if isActive();
+      allow delete: if isAdmin();
+
+      // Mensagens são gravadas pelo servidor; o cliente só cria em dados de demonstração (admin)
+      match /messages/{messageId} {
+        allow read: if isActive();
+        allow create, delete: if isAdmin();
+        allow update: if false;
+      }
+    }
+
+    // Coleção antiga de mensagens (versão anterior)
+    match /messages/{messageId} {
+      allow read: if isActive();
+      allow delete: if isAdmin();
+    }
+
+    match /whatsapp_instances/{instanceId} {
+      allow read: if isActive();
+      allow write: if false;
+    }
+
+    match /quick_replies/{replyId} {
+      allow read: if isActive();
+      allow create: if isActive() && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.title is string && request.resource.data.title.size() <= 60
+        && request.resource.data.body is string && request.resource.data.body.size() <= 2000;
+      allow update, delete: if isManager() || (isActive() && resource.data.createdBy == request.auth.uid);
     }
 
     match /integration_settings/{settingId} {
-      allow read, write: if isSignedIn();
+      allow read: if isActive();
+      allow write: if isAdmin();
     }
   }
 }

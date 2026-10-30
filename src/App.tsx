@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext.tsx';
 import { ToastProvider, useToast } from './components/common/Toast.tsx';
 import { Sidebar, NavTab } from './components/layout/Sidebar.tsx';
 import { Header } from './components/layout/Header.tsx';
 import { AuthScreen } from './components/auth/AuthScreen.tsx';
+import { PendingApprovalScreen } from './components/auth/PendingApprovalScreen.tsx';
 import { DashboardView } from './components/dashboard/DashboardView.tsx';
 import { LeadsView } from './components/leads/LeadsView.tsx';
 import { KanbanView } from './components/kanban/KanbanView.tsx';
@@ -16,6 +17,7 @@ import { InboxView } from './components/inbox/InboxView.tsx';
 import { TasksView } from './components/tasks/TasksView.tsx';
 import { ReportsView } from './components/reports/ReportsView.tsx';
 import { WhatsAppIntegrationView } from './components/whatsapp/WhatsAppIntegrationView.tsx';
+import { InstancePickerModal } from './components/whatsapp/InstancePickerModal.tsx';
 import { SettingsView } from './components/settings/SettingsView.tsx';
 import { LeadDrawer } from './components/leads/LeadDrawer.tsx';
 import { NewLeadModal } from './components/leads/NewLeadModal.tsx';
@@ -25,7 +27,8 @@ import {
   Task,
   Conversation,
   Activity,
-  WhatsAppConnectionState,
+  WhatsAppInstance,
+  UserProfile,
 } from './types/crm.ts';
 import {
   subscribeStages,
@@ -33,117 +36,117 @@ import {
   subscribeLeads,
   subscribeTasks,
   subscribeConversations,
+  subscribeInstances,
+  subscribeUsers,
   getOrCreateConversationForLead,
 } from './services/crmService.ts';
+import { useIncomingMessageAlerts } from './hooks/useIncomingMessageAlerts.ts';
 import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
 import { db } from './lib/firebase.ts';
 
 function CRMContent() {
-  const { user, profile, loading: authLoading } = useAuth();
-  const { error, success } = useToast();
+  const { user, profile, loading: authLoading, isActive } = useAuth();
+  const { error } = useToast();
 
   const [currentTab, setCurrentTab] = useState<NavTab>('dashboard');
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
-  // Firestore States
   const [stages, setStages] = useState<PipelineStage[]>([]);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [recentActivities, setRecentActivities] = useState<Activity[]>([]);
+  const [instances, setInstances] = useState<WhatsAppInstance[]>([]);
+  const [team, setTeam] = useState<UserProfile[]>([]);
 
-  // WhatsApp connection state
-  const [whatsAppConnection, setWhatsAppConnection] = useState<WhatsAppConnectionState>({
-    status: 'disconnected',
-    updatedAt: new Date().toISOString(),
-  });
-
-  // Modal & Drawer states
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [isNewLeadModalOpen, setIsNewLeadModalOpen] = useState(false);
-  const [selectedLeadForChat, setSelectedLeadForChat] = useState<Lead | null>(null);
-
-  // Consulta do estado de conexão da Evolution API
-  const refreshWhatsAppStatus = async () => {
-    try {
-      const response = await fetch('/api/whatsapp/status');
-      if (response.ok) {
-        const data = await response.json();
-        setWhatsAppConnection({
-          status: data.state || (data.configured ? 'connecting' : 'disconnected'),
-          instanceName: data.instanceName,
-          connectedPhone: data.connectedPhone,
-          lastConnectedAt: data.lastCheckedAt,
-          errorMessage: data.message,
-          updatedAt: data.lastCheckedAt || new Date().toISOString(),
-        });
-      }
-    } catch (err) {
-      console.warn('Erro ao consultar status da Evolution API:', err);
-    }
-  };
+  const [focusConversationId, setFocusConversationId] = useState<string | null>(null);
+  const [leadAwaitingInstance, setLeadAwaitingInstance] = useState<Lead | null>(null);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user || !isActive) return;
 
-    // Inicializa etapas padrão se vazias
     ensureDefaultStagesExist().then((initialStages) => {
       if (initialStages.length > 0) setStages(initialStages);
     });
 
-    // Assina etapas
-    const unsubStages = subscribeStages((updatedStages) => {
-      setStages(updatedStages);
-    });
+    const unsubs = [
+      subscribeStages(setStages),
+      subscribeLeads(setLeads),
+      subscribeTasks(setTasks),
+      subscribeConversations(setConversations),
+      subscribeInstances(setInstances),
+      subscribeUsers(setTeam),
+      onSnapshot(query(collection(db, 'activities'), orderBy('timestamp', 'desc'), limit(25)), (snap) => {
+        setRecentActivities(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
+      }),
+    ];
 
-    // Assina leads
-    const unsubLeads = subscribeLeads((updatedLeads) => {
-      setLeads(updatedLeads);
-    });
+    return () => unsubs.forEach((u) => u && u());
+  }, [user, isActive]);
 
-    // Assina tarefas
-    const unsubTasks = subscribeTasks((updatedTasks) => {
-      setTasks(updatedTasks);
-    });
+  useIncomingMessageAlerts({
+    conversations,
+    userId: user?.uid || null,
+    viewingConversationId: currentTab === 'inbox' ? focusConversationId : null,
+    onOpen: (id) => {
+      setFocusConversationId(id);
+      setCurrentTab('inbox');
+    },
+  });
 
-    // Assina conversas
-    const unsubConvs = subscribeConversations((updatedConvs) => {
-      setConversations(updatedConvs);
-    });
-
-    // Assina atividades recentes globais para o dashboard
-    const actQuery = query(collection(db, 'activities'), orderBy('timestamp', 'desc'), limit(25));
-    const unsubActs = onSnapshot(actQuery, (snap) => {
-      const acts: Activity[] = [];
-      snap.forEach((d) => acts.push({ id: d.id, ...(d.data() as any) }));
-      setRecentActivities(acts);
-    });
-
-    // Checa status do WhatsApp
-    refreshWhatsAppStatus();
-    const interval = setInterval(refreshWhatsAppStatus, 15000);
-
-    return () => {
-      if (unsubStages) unsubStages();
-      if (unsubLeads) unsubLeads();
-      if (unsubTasks) unsubTasks();
-      if (unsubConvs) unsubConvs();
-      if (unsubActs) unsubActs();
-      clearInterval(interval);
-    };
-  }, [user]);
-
-  // Se o usuário clicar para conversar com um lead
-  const handleOpenWhatsAppFromLead = async (lead: Lead) => {
+  const openConversationForLead = async (lead: Lead, instance: WhatsAppInstance) => {
+    if (!user || !profile) return;
     try {
-      await getOrCreateConversationForLead(lead);
-      setSelectedLeadForChat(lead);
+      const conv = await getOrCreateConversationForLead(lead, instance, { uid: user.uid, name: profile.name });
+      setFocusConversationId(conv.id);
       setSelectedLead(null);
       setCurrentTab('inbox');
     } catch (err: any) {
       error('Erro ao abrir conversa', err.message);
     }
   };
+
+  /** Ao clicar em "WhatsApp" num lead: reaproveita a conversa existente ou escolhe o número certo. */
+  const handleOpenWhatsAppFromLead = async (lead: Lead) => {
+    if (!user) return;
+    const existing = conversations
+      .filter((c) => c.leadId === lead.id)
+      .sort((a, b) => (b.lastMessageAt || '').localeCompare(a.lastMessageAt || ''));
+    if (existing.length > 0) {
+      setFocusConversationId(existing[0].id);
+      setSelectedLead(null);
+      setCurrentTab('inbox');
+      return;
+    }
+
+    if (instances.length === 0) {
+      error('Nenhum número de WhatsApp cadastrado', 'Adicione e conecte um número em Integração WhatsApp.');
+      setCurrentTab('whatsapp');
+      return;
+    }
+
+    const connected = instances.filter((i) => i.state === 'connected');
+    const mine = connected.filter((i) => i.ownerId === user.uid);
+    const leadOwners = connected.filter((i) => i.ownerId && i.ownerId === lead.ownerId);
+    const choice =
+      mine.length === 1 ? mine[0] : mine.length === 0 && leadOwners.length === 1 ? leadOwners[0] : connected.length === 1 && mine.length === 0 ? connected[0] : null;
+
+    if (choice) {
+      await openConversationForLead(lead, choice);
+    } else {
+      setLeadAwaitingInstance(lead);
+    }
+  };
+
+  const unreadMessagesTotal = useMemo(
+    () =>
+      conversations
+        .filter((c) => !c.assignedTo || c.assignedTo === user?.uid)
+        .reduce((acc, c) => acc + (c.unreadCount || 0), 0),
+    [conversations, user?.uid]
+  );
 
   if (authLoading) {
     return (
@@ -156,27 +159,22 @@ function CRMContent() {
     );
   }
 
-  // Login obrigatório
-  if (!user) {
-    return <AuthScreen />;
-  }
-
-  const unreadMessagesTotal = conversations.reduce((acc, c) => acc + (c.unreadCount || 0), 0);
+  if (!user) return <AuthScreen />;
+  if (!isActive) return <PendingApprovalScreen />;
 
   return (
     <div className="min-h-screen bg-slate-50 flex">
-      {/* Sidebar de Navegação */}
       <Sidebar
         currentTab={currentTab}
         onSelectTab={setCurrentTab}
         isOpenMobile={isMobileSidebarOpen}
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
         unreadCount={unreadMessagesTotal}
-        whatsAppStatus={whatsAppConnection.status}
+        instances={instances}
+        pendingUsers={team.filter((u) => u.active === false).length}
       />
 
-      {/* Área de Conteúdo Principal */}
-      <div className="flex-1 lg:pl-64 flex flex-col min-h-screen">
+      <div className="flex-1 lg:pl-64 flex flex-col min-h-screen min-w-0">
         <Header
           currentTab={currentTab}
           onOpenMobileSidebar={() => setIsMobileSidebarOpen(true)}
@@ -184,7 +182,7 @@ function CRMContent() {
           onOpenQuickTaskModal={() => setCurrentTab('tasks')}
         />
 
-        <main className="flex-1 p-4 sm:p-6 max-w-7xl w-full mx-auto">
+        <main className={`flex-1 w-full mx-auto ${currentTab === 'inbox' ? 'p-0 sm:p-4 max-w-[1600px]' : 'p-4 sm:p-6 max-w-7xl'}`}>
           {currentTab === 'dashboard' && (
             <DashboardView
               leads={leads}
@@ -221,44 +219,27 @@ function CRMContent() {
               conversations={conversations}
               leads={leads}
               stages={stages}
-              whatsAppStatus={whatsAppConnection.status}
-              selectedLeadForChat={selectedLeadForChat}
-              onClearSelectedLead={() => setSelectedLeadForChat(null)}
+              instances={instances}
+              team={team}
+              focusConversationId={focusConversationId}
+              onFocusConversation={setFocusConversationId}
               onOpenLead={(lead) => setSelectedLead(lead)}
               onNavigateToIntegration={() => setCurrentTab('whatsapp')}
             />
           )}
 
           {currentTab === 'tasks' && (
-            <TasksView
-              tasks={tasks}
-              leads={leads}
-              onOpenLead={(lead) => setSelectedLead(lead)}
-            />
+            <TasksView tasks={tasks} leads={leads} onOpenLead={(lead) => setSelectedLead(lead)} />
           )}
 
-          {currentTab === 'reports' && (
-            <ReportsView
-              leads={leads}
-              stages={stages}
-              tasks={tasks}
-            />
-          )}
+          {currentTab === 'reports' && <ReportsView leads={leads} stages={stages} tasks={tasks} />}
 
-          {currentTab === 'whatsapp' && (
-            <WhatsAppIntegrationView
-              connectionState={whatsAppConnection}
-              onRefreshStatus={refreshWhatsAppStatus}
-            />
-          )}
+          {currentTab === 'whatsapp' && <WhatsAppIntegrationView instances={instances} team={team} />}
 
-          {currentTab === 'settings' && (
-            <SettingsView stages={stages} />
-          )}
+          {currentTab === 'settings' && <SettingsView stages={stages} team={team} />}
         </main>
       </div>
 
-      {/* Drawer Lateral de Detalhes do Lead */}
       <LeadDrawer
         lead={selectedLead}
         stages={stages}
@@ -267,7 +248,6 @@ function CRMContent() {
         onOpenWhatsApp={handleOpenWhatsAppFromLead}
       />
 
-      {/* Modal de Criação de Novo Lead */}
       <NewLeadModal
         isOpen={isNewLeadModalOpen}
         stages={stages}
@@ -276,6 +256,18 @@ function CRMContent() {
         onLeadCreated={(leadId) => {
           const created = leads.find((l) => l.id === leadId);
           if (created) setSelectedLead(created);
+        }}
+      />
+
+      <InstancePickerModal
+        lead={leadAwaitingInstance}
+        instances={instances}
+        currentUserId={user.uid}
+        onClose={() => setLeadAwaitingInstance(null)}
+        onPick={(inst) => {
+          const lead = leadAwaitingInstance;
+          setLeadAwaitingInstance(null);
+          if (lead) openConversationForLead(lead, inst);
         }}
       />
     </div>

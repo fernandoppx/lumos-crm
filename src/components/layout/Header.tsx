@@ -24,15 +24,15 @@ export const Header: React.FC<HeaderProps> = ({
       case 'kanban':
         return { title: 'Quadro Kanban', subtitle: 'Pipeline de vendas e evolução de oportunidades' };
       case 'inbox':
-        return { title: 'Caixa de Entrada WhatsApp', subtitle: 'Atendimento comercial individual e conversas' };
+        return { title: 'Caixa de Entrada', subtitle: 'Conversas de WhatsApp de todos os números da equipe' };
       case 'tasks':
         return { title: 'Tarefas e Follow-ups', subtitle: 'Lembretes de contato e compromissos comerciais' };
       case 'reports':
         return { title: 'Relatórios de Desempenho', subtitle: 'Análise de funil, origens e conversão' };
       case 'whatsapp':
-        return { title: 'Integração WhatsApp (QR Code)', subtitle: 'Conexão via Evolution API e webhooks' };
+        return { title: 'Números de WhatsApp', subtitle: 'Conecte o WhatsApp de cada vendedor por QR Code' };
       case 'settings':
-        return { title: 'Configurações do CRM', subtitle: 'Etapas de funil, ambiente e dados' };
+        return { title: 'Configurações do CRM', subtitle: 'Equipe, respostas rápidas e etapas do funil' };
     }
   };
 

@@ -11,10 +11,11 @@ import {
   where,
   orderBy,
   onSnapshot,
-  Timestamp,
   writeBatch,
+  limit,
+  increment,
 } from 'firebase/firestore';
-import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
 import {
   Lead,
   PipelineStage,
@@ -23,7 +24,12 @@ import {
   Conversation,
   Message,
   DEFAULT_PIPELINE_STAGES,
+  WhatsAppInstance,
+  UserProfile,
+  UserRole,
+  QuickReply,
 } from '../types/crm.ts';
+import { apiFetch } from '../lib/api.ts';
 import { normalizePhone } from '../utils/formatters.ts';
 
 // Coleções
@@ -386,11 +392,8 @@ export function subscribeLeadActivities(
   onUpdate: (activities: Activity[]) => void
 ) {
   try {
-    const q = query(
-      collection(db, ACTIVITIES_COL),
-      where('leadId', '==', leadId),
-      orderBy('timestamp', 'desc')
-    );
+    // Sem orderBy na consulta para não depender de índice composto; ordena no navegador
+    const q = query(collection(db, ACTIVITIES_COL), where('leadId', '==', leadId));
     return onSnapshot(
       q,
       (snapshot) => {
@@ -398,6 +401,7 @@ export function subscribeLeadActivities(
         snapshot.forEach((docSnap) => {
           activities.push({ id: docSnap.id, ...(docSnap.data() as any) });
         });
+        activities.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
         onUpdate(activities);
       },
       (error) => {
@@ -436,175 +440,260 @@ export async function addLeadNote(
 
 // --- CONVERSAS E MENSAGENS WHATSAPP ---
 
+export function conversationIdFor(instanceId: string, phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  const safeInstance = instanceId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `conv_${safeInstance}_${digits}`;
+}
+
 export function subscribeConversations(
   onUpdate: (conversations: Conversation[]) => void,
   onError?: (err: any) => void
 ) {
-  try {
-    const q = query(collection(db, CONVERSATIONS_COL), orderBy('lastMessageAt', 'desc'));
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const convs: Conversation[] = [];
-        snapshot.forEach((docSnap) => {
-          convs.push({ id: docSnap.id, ...(docSnap.data() as any) });
-        });
-        onUpdate(convs);
-      },
-      (error) => {
-        if (onError) onError(error);
-        handleFirestoreError(error, OperationType.LIST, CONVERSATIONS_COL);
-      }
-    );
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, CONVERSATIONS_COL);
-  }
-}
-
-export function subscribeMessages(
-  conversationId: string,
-  onUpdate: (messages: Message[]) => void
-) {
-  try {
-    const q = query(
-      collection(db, MESSAGES_COL),
-      where('conversationId', '==', conversationId),
-      orderBy('timestamp', 'asc')
-    );
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const msgs: Message[] = [];
-        snapshot.forEach((docSnap) => {
-          msgs.push({ id: docSnap.id, ...(docSnap.data() as any) });
-        });
-        onUpdate(msgs);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, MESSAGES_COL);
-      }
-    );
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, MESSAGES_COL);
-  }
-}
-
-export async function getOrCreateConversationForLead(lead: Lead): Promise<Conversation> {
-  try {
-    const normalizedPhone = normalizePhone(lead.phone);
-    // Busca se já existe conversa com este telefone ou leadId
-    const q = query(collection(db, CONVERSATIONS_COL), where('phone', '==', normalizedPhone));
-    const snapshot = await getDocs(q);
-
-    if (!snapshot.empty) {
-      const docSnap = snapshot.docs[0];
-      const existing = { id: docSnap.id, ...(docSnap.data() as any) } as Conversation;
-      if (!existing.leadId) {
-        await updateDoc(doc(db, CONVERSATIONS_COL, existing.id), { leadId: lead.id });
-      }
-      return existing;
+  const q = query(collection(db, CONVERSATIONS_COL), orderBy('lastMessageAt', 'desc'), limit(500));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const convs: Conversation[] = [];
+      snapshot.forEach((docSnap) => {
+        convs.push({ id: docSnap.id, ...(docSnap.data() as any) });
+      });
+      onUpdate(convs);
+    },
+    (error) => {
+      console.error('Erro ao carregar conversas:', error);
+      if (onError) onError(error);
     }
-
-    // Cria nova conversa
-    const now = new Date().toISOString();
-    const newConvData: Omit<Conversation, 'id'> = {
-      phone: normalizedPhone,
-      contactName: lead.name,
-      leadId: lead.id,
-      lastMessage: 'Conversa iniciada pelo Lumus CRM',
-      lastMessageAt: now,
-      unreadCount: 0,
-      assignedTo: lead.ownerId,
-      status: 'open',
-      updatedAt: now,
-    };
-
-    const docRef = await addDoc(collection(db, CONVERSATIONS_COL), newConvData);
-    return { id: docRef.id, ...newConvData };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, CONVERSATIONS_COL);
-  }
+  );
 }
 
-export async function sendMessage(
-  conversation: Conversation,
-  body: string,
-  user: { uid: string; name: string }
-): Promise<{ success: boolean; error?: string }> {
-  const now = new Date().toISOString();
-
-  // 1. Cria mensagem local em estado 'sending'
-  const messageRef = doc(collection(db, MESSAGES_COL));
-  const newMsg: Message = {
-    id: messageRef.id,
-    conversationId: conversation.id,
-    leadId: conversation.leadId,
-    sender: 'user',
-    fromMe: true,
-    body,
-    status: 'sending',
-    mediaType: 'text',
-    timestamp: now,
+/**
+ * Mensagens de uma conversa (últimas 300), em ordem cronológica.
+ * Lê também a coleção antiga `messages` para conversas criadas pela versão anterior.
+ */
+export function subscribeMessages(conversationId: string, onUpdate: (messages: Message[]) => void) {
+  let current: Message[] = [];
+  let legacy: Message[] = [];
+  const emit = () => {
+    const all = [...legacy, ...current];
+    all.sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+    onUpdate(all);
   };
 
-  try {
-    await setDoc(messageRef, newMsg);
-
-    // 2. Chama API backend para envio real via Evolution API
-    const response = await fetch('/api/whatsapp/send-message', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        phone: conversation.phone,
-        message: body,
-      }),
-    });
-
-    const result = await response.json();
-
-    if (response.ok && result.success) {
-      // Atualiza mensagem para sent com ID externo retornado
-      await updateDoc(messageRef, {
-        status: 'sent',
-        externalId: result.externalId || null,
-      });
-
-      // Atualiza conversa
-      await updateDoc(doc(db, CONVERSATIONS_COL, conversation.id), {
-        lastMessage: body,
-        lastMessageAt: now,
-        updatedAt: now,
-      });
-
-      // Se vinculado a um lead, atualiza lastContactAt e cria atividade
-      if (conversation.leadId) {
-        await updateDoc(doc(db, LEADS_COL, conversation.leadId), {
-          lastContactAt: now,
-          updatedAt: now,
-        });
-
-        await addDoc(collection(db, ACTIVITIES_COL), {
-          leadId: conversation.leadId,
-          userId: user.uid,
-          userName: user.name,
-          type: 'whatsapp_sent',
-          description: `Mensagem enviada por WhatsApp: "${body.slice(0, 50)}${body.length > 50 ? '...' : ''}"`,
-          timestamp: now,
-        });
-      }
-
-      return { success: true };
-    } else {
-      // Marca como failed com mensagem de erro real
-      await updateDoc(messageRef, {
-        status: 'failed',
-      });
-      return { success: false, error: result.error || 'Falha ao enviar mensagem.' };
+  const unsubNew = onSnapshot(
+    query(collection(db, CONVERSATIONS_COL, conversationId, 'messages'), orderBy('timestamp', 'desc'), limit(300)),
+    (snap) => {
+      current = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+      emit();
+    },
+    (err) => console.error('Erro ao carregar mensagens:', err)
+  );
+  const unsubLegacy = onSnapshot(
+    query(collection(db, MESSAGES_COL), where('conversationId', '==', conversationId)),
+    (snap) => {
+      legacy = snap.docs.map((d) => ({ id: `legacy_${d.id}`, ...(d.data() as any) }));
+      emit();
+    },
+    () => {
+      legacy = [];
     }
-  } catch (error: any) {
-    await updateDoc(messageRef, { status: 'failed' });
-    return { success: false, error: error.message || 'Erro inesperado no envio.' };
+  );
+  return () => {
+    unsubNew();
+    unsubLegacy();
+  };
+}
+
+/** Abre (ou cria) a conversa de um lead em um número específico. */
+export async function getOrCreateConversationForLead(
+  lead: Lead,
+  instance: Pick<WhatsAppInstance, 'id' | 'label' | 'ownerId' | 'ownerName'>,
+  currentUser: { uid: string; name: string }
+): Promise<Conversation> {
+  const normalizedPhone = normalizePhone(lead.phone);
+  if (!normalizedPhone) throw new Error('Este lead não tem um telefone válido.');
+  const convId = conversationIdFor(instance.id, normalizedPhone);
+  const ref = doc(db, CONVERSATIONS_COL, convId);
+  const snap = await getDoc(ref);
+  if (snap.exists()) {
+    const existing = { id: snap.id, ...(snap.data() as any) } as Conversation;
+    if (!existing.leadId) {
+      await updateDoc(ref, { leadId: lead.id, contactName: lead.name });
+    }
+    return existing;
   }
+
+  const now = new Date().toISOString();
+  const newConvData: Omit<Conversation, 'id'> = {
+    phone: normalizedPhone,
+    contactName: lead.name,
+    leadId: lead.id,
+    instanceId: instance.id,
+    instanceLabel: instance.label,
+    lastMessage: 'Conversa iniciada pelo CRM',
+    lastMessageAt: now,
+    unreadCount: 0,
+    assignedTo: lead.ownerId || currentUser.uid,
+    assignedToName: lead.ownerName || currentUser.name,
+    status: 'open',
+    updatedAt: now,
+  };
+  await setDoc(ref, { ...newConvData, createdAt: now });
+  return { id: convId, ...newConvData };
+}
+
+export async function sendMessage(conversation: Conversation, body: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    await apiFetch('/api/whatsapp/send', { body: { conversationId: conversation.id, text: body } });
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function sendMediaMessage(
+  conversation: Conversation,
+  file: { base64: string; mimetype: string; fileName: string; caption?: string }
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await apiFetch('/api/whatsapp/send-media', { body: { conversationId: conversation.id, ...file } });
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function markConversationRead(conversationId: string): Promise<void> {
+  try {
+    await updateDoc(doc(db, CONVERSATIONS_COL, conversationId), { unreadCount: 0 });
+  } catch (err) {
+    console.warn('Não foi possível marcar como lida:', err);
+  }
+}
+
+export async function markConversationUnread(conversationId: string): Promise<void> {
+  await updateDoc(doc(db, CONVERSATIONS_COL, conversationId), { unreadCount: increment(1) });
+}
+
+export async function assignConversation(
+  conversation: Conversation,
+  assignee: { uid: string; name: string } | null,
+  by: { uid: string; name: string }
+): Promise<void> {
+  await updateDoc(doc(db, CONVERSATIONS_COL, conversation.id), {
+    assignedTo: assignee?.uid || null,
+    assignedToName: assignee?.name || null,
+    updatedAt: new Date().toISOString(),
+  });
+  if (conversation.leadId) {
+    await addDoc(collection(db, ACTIVITIES_COL), {
+      leadId: conversation.leadId,
+      userId: by.uid,
+      userName: by.name,
+      type: 'lead_updated',
+      description: assignee
+        ? `Conversa de WhatsApp transferida para ${assignee.name}`
+        : 'Conversa de WhatsApp liberada (sem responsável)',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
+export async function setConversationStatus(conversationId: string, status: Conversation['status']): Promise<void> {
+  await updateDoc(doc(db, CONVERSATIONS_COL, conversationId), { status, updatedAt: new Date().toISOString() });
+}
+
+// --- NÚMEROS DE WHATSAPP (instâncias) ---
+
+export function subscribeInstances(onUpdate: (instances: WhatsAppInstance[]) => void) {
+  return onSnapshot(
+    collection(db, 'whatsapp_instances'),
+    (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }) as WhatsAppInstance);
+      list.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      onUpdate(list);
+    },
+    (err) => {
+      console.error('Erro ao carregar números de WhatsApp:', err);
+      onUpdate([]);
+    }
+  );
+}
+
+export const instanceApi = {
+  create: (label: string, ownerId?: string | null) =>
+    apiFetch<WhatsAppInstance>('/api/whatsapp/instances', { body: { label, ownerId } }),
+  importExisting: (instanceName: string, label: string, ownerId?: string | null) =>
+    apiFetch<WhatsAppInstance>('/api/whatsapp/instances/import', { body: { instanceName, label, ownerId } }),
+  update: (id: string, updates: { label?: string; ownerId?: string | null }) =>
+    apiFetch(`/api/whatsapp/instances/${encodeURIComponent(id)}`, { method: 'PATCH', body: updates }),
+  qrcode: (id: string) =>
+    apiFetch<{ qrCodeBase64?: string; pairingCode?: string; state: string }>(
+      `/api/whatsapp/instances/${encodeURIComponent(id)}/qrcode`,
+      { method: 'POST' }
+    ),
+  refresh: (id: string) => apiFetch(`/api/whatsapp/instances/${encodeURIComponent(id)}/refresh`, { method: 'POST' }),
+  reapplyWebhook: (id: string) =>
+    apiFetch(`/api/whatsapp/instances/${encodeURIComponent(id)}/webhook`, { method: 'POST' }),
+  logout: (id: string) => apiFetch(`/api/whatsapp/instances/${encodeURIComponent(id)}/logout`, { method: 'POST' }),
+  remove: (id: string, force = false) =>
+    apiFetch(`/api/whatsapp/instances/${encodeURIComponent(id)}${force ? '?force=1' : ''}`, { method: 'DELETE' }),
+};
+
+// --- EQUIPE ---
+
+export function subscribeUsers(onUpdate: (users: UserProfile[]) => void) {
+  return onSnapshot(
+    collection(db, 'users'),
+    (snap) => {
+      const list = snap.docs.map((d) => d.data() as UserProfile);
+      list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      onUpdate(list);
+    },
+    () => onUpdate([])
+  );
+}
+
+export async function updateUserAccess(
+  uid: string,
+  updates: { active?: boolean; role?: UserRole },
+  by: { uid: string }
+): Promise<void> {
+  const data: Record<string, any> = { ...updates };
+  if (updates.active !== undefined) {
+    // registra a decisão (aprovar, recusar ou bloquear) para tirar a conta da fila de pendentes
+    data.approvedBy = by.uid;
+    data.approvedAt = new Date().toISOString();
+  }
+  await updateDoc(doc(db, 'users', uid), data);
+}
+
+// --- RESPOSTAS RÁPIDAS ---
+
+export function subscribeQuickReplies(onUpdate: (replies: QuickReply[]) => void) {
+  return onSnapshot(
+    collection(db, 'quick_replies'),
+    (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }) as QuickReply);
+      list.sort((a, b) => a.title.localeCompare(b.title));
+      onUpdate(list);
+    },
+    () => onUpdate([])
+  );
+}
+
+export async function createQuickReply(title: string, body: string, user: { uid: string; name: string }) {
+  await addDoc(collection(db, 'quick_replies'), {
+    title: title.trim().slice(0, 60),
+    body: body.trim().slice(0, 2000),
+    createdBy: user.uid,
+    createdByName: user.name,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+export async function deleteQuickReply(id: string) {
+  await deleteDoc(doc(db, 'quick_replies', id));
 }
 
 // --- DADOS DE DEMONSTRAÇÃO ---
@@ -813,8 +902,11 @@ export async function seedDemoData(user: { uid: string; name: string }): Promise
 
     // Cria conversa de exemplo para Mariane e Rodrigo
     if (leadData.name === 'Rodrigo Santoro' || leadData.name === 'Mariana Duarte') {
-      const convRef = doc(collection(db, CONVERSATIONS_COL));
+      const convRef = doc(db, CONVERSATIONS_COL, conversationIdFor('demo', leadData.phone));
       const convData: Omit<Conversation, 'id'> = {
+        instanceId: 'demo',
+        instanceLabel: 'Demonstração',
+        assignedToName: user.name,
         phone: leadData.phone,
         contactName: leadData.name,
         leadId: leadRef.id,
@@ -828,7 +920,7 @@ export async function seedDemoData(user: { uid: string; name: string }): Promise
       await setDoc(convRef, convData);
 
       // Adiciona mensagem
-      await addDoc(collection(db, MESSAGES_COL), {
+      await addDoc(collection(db, CONVERSATIONS_COL, convRef.id, 'messages'), {
         conversationId: convRef.id,
         leadId: leadRef.id,
         sender: 'contact',
@@ -842,12 +934,23 @@ export async function seedDemoData(user: { uid: string; name: string }): Promise
   }
 }
 
-export async function clearAllDemoData(): Promise<void> {
-  const collectionsToClear = [LEADS_COL, TASKS_COL, ACTIVITIES_COL, CONVERSATIONS_COL, MESSAGES_COL];
-  for (const colName of collectionsToClear) {
-    const snap = await getDocs(collection(db, colName));
+/** Apaga em lotes de até 400 (o Firestore aceita no máximo 500 operações por lote). */
+async function deleteInChunks(refs: { path: string }[]): Promise<void> {
+  for (let i = 0; i < refs.length; i += 400) {
     const batch = writeBatch(db);
-    snap.docs.forEach((d) => batch.delete(d.ref));
+    refs.slice(i, i + 400).forEach((r: any) => batch.delete(r));
     await batch.commit();
+  }
+}
+
+export async function clearAllDemoData(): Promise<void> {
+  const convs = await getDocs(collection(db, CONVERSATIONS_COL));
+  for (const c of convs.docs) {
+    const msgs = await getDocs(collection(db, CONVERSATIONS_COL, c.id, 'messages'));
+    await deleteInChunks(msgs.docs.map((d) => d.ref));
+  }
+  for (const colName of [LEADS_COL, TASKS_COL, ACTIVITIES_COL, CONVERSATIONS_COL, MESSAGES_COL]) {
+    const snap = await getDocs(collection(db, colName));
+    await deleteInChunks(snap.docs.map((d) => d.ref));
   }
 }

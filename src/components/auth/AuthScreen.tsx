@@ -197,7 +197,7 @@ export const AuthScreen: React.FC = () => {
               disabled={loading}
               className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-xs shadow-xs transition-colors disabled:opacity-50 mt-2"
             >
-              <span>{isSignUp ? 'Criar Conta de Acesso' : 'Entrar no Sistema'}</span>
+              <span>{isSignUp ? 'Solicitar Acesso' : 'Entrar no Sistema'}</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </form>
@@ -211,7 +211,7 @@ export const AuthScreen: React.FC = () => {
               }}
               className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
             >
-              {isSignUp ? 'Já possui acesso? Entrar agora' : 'Primeiro acesso? Criar credencial'}
+              {isSignUp ? 'Já possui acesso? Entrar agora' : 'Primeiro acesso? Solicitar acesso'}
             </button>
           </div>
         </div>

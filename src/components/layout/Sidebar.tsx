@@ -10,10 +10,9 @@ import {
   Settings,
   LogOut,
   X,
-  ShieldAlert,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext.tsx';
-import { WhatsAppConnectionState } from '../../types/crm.ts';
+import { WhatsAppInstance } from '../../types/crm.ts';
 
 export type NavTab =
   | 'dashboard'
@@ -31,7 +30,8 @@ interface SidebarProps {
   isOpenMobile: boolean;
   onCloseMobile: () => void;
   unreadCount?: number;
-  whatsAppStatus: WhatsAppConnectionState['status'];
+  instances: WhatsAppInstance[];
+  pendingUsers?: number;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -40,9 +40,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   isOpenMobile,
   onCloseMobile,
   unreadCount = 0,
-  whatsAppStatus,
+  instances,
+  pendingUsers = 0,
 }) => {
-  const { profile, logout } = useAuth();
+  const { profile, logout, isAdmin } = useAuth();
 
   const navItems = [
     { id: 'dashboard' as NavTab, label: 'Dashboard', icon: LayoutDashboard },
@@ -56,29 +57,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
     },
     { id: 'tasks' as NavTab, label: 'Tarefas', icon: CheckSquare },
     { id: 'reports' as NavTab, label: 'Relatórios', icon: BarChart3 },
+    { id: 'whatsapp' as NavTab, label: 'Números de WhatsApp', icon: QrCode },
     {
-      id: 'whatsapp' as NavTab,
-      label: 'Integração WhatsApp',
-      icon: QrCode,
-      statusDot: whatsAppStatus,
+      id: 'settings' as NavTab,
+      label: 'Configurações',
+      icon: Settings,
+      badge: isAdmin && pendingUsers > 0 ? pendingUsers : undefined,
     },
-    { id: 'settings' as NavTab, label: 'Configurações', icon: Settings },
   ];
 
-  const getStatusLabel = (status: WhatsAppConnectionState['status']) => {
-    switch (status) {
-      case 'connected':
-        return { label: 'Conectado', color: 'text-emerald-700 bg-emerald-50 border-emerald-200' };
-      case 'connecting':
-        return { label: 'Aguardando QR', color: 'text-amber-700 bg-amber-50 border-amber-200' };
-      case 'error':
-        return { label: 'Erro de conexão', color: 'text-rose-700 bg-rose-50 border-rose-200' };
-      default:
-        return { label: 'Desconectado', color: 'text-slate-600 bg-slate-100 border-slate-200' };
-    }
-  };
-
-  const statusInfo = getStatusLabel(whatsAppStatus);
+  const connectedCount = instances.filter((i) => i.state === 'connected').length;
+  const statusInfo =
+    instances.length === 0
+      ? { label: 'Nenhum número', color: 'text-slate-600 bg-slate-100 border-slate-200' }
+      : connectedCount === instances.length
+        ? { label: `${connectedCount}/${instances.length} conectados`, color: 'text-emerald-700 bg-emerald-50 border-emerald-200' }
+        : connectedCount === 0
+          ? { label: `0/${instances.length} conectados`, color: 'text-rose-700 bg-rose-50 border-rose-200' }
+          : { label: `${connectedCount}/${instances.length} conectados`, color: 'text-amber-700 bg-amber-50 border-amber-200' };
 
   return (
     <>
@@ -119,14 +115,40 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
 
         {/* Status da Conexão WhatsApp */}
-        <div className="px-4 py-3 border-b border-slate-100 bg-slate-50/50">
+        <button
+          type="button"
+          onClick={() => {
+            onSelectTab('whatsapp');
+            onCloseMobile();
+          }}
+          className="px-4 py-3 border-b border-slate-100 bg-slate-50/50 text-left hover:bg-slate-100/70 transition-colors"
+          title="Ver números de WhatsApp"
+        >
           <div className="flex items-center justify-between text-xs">
             <span className="text-slate-500 font-medium">WhatsApp</span>
             <span className={`px-2 py-0.5 text-[10px] font-semibold border rounded ${statusInfo.color}`}>
               {statusInfo.label}
             </span>
           </div>
-        </div>
+          {instances.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {instances.slice(0, 6).map((i) => (
+                <span
+                  key={i.id}
+                  title={`${i.label} — ${i.state === 'connected' ? 'conectado' : i.state === 'connecting' ? 'aguardando QR Code' : 'desconectado'}`}
+                  className="inline-flex items-center gap-1 text-[10px] text-slate-500 max-w-[6.5rem]"
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                      i.state === 'connected' ? 'bg-emerald-500' : i.state === 'connecting' ? 'bg-amber-400' : 'bg-rose-400'
+                    }`}
+                  />
+                  <span className="truncate">{i.label}</span>
+                </span>
+              ))}
+            </div>
+          )}
+        </button>
 
         {/* Menu Navigation Links */}
         <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">

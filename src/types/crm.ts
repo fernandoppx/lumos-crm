@@ -2,9 +2,25 @@ export interface UserProfile {
   uid: string;
   name: string;
   email: string;
-  role: 'admin' | 'sales_rep' | 'manager';
+  role: UserRole;
+  /** false = aguardando aprovação de um administrador. Ausente = conta antiga (considerada ativa). */
+  active?: boolean;
   avatarUrl?: string;
   createdAt: string;
+  approvedBy?: string;
+  approvedAt?: string;
+}
+
+export type UserRole = 'admin' | 'sales_rep' | 'manager';
+
+export const ROLE_LABELS: Record<UserRole, string> = {
+  admin: 'Administrador',
+  manager: 'Gestor',
+  sales_rep: 'Vendedor',
+};
+
+export function isProfileActive(profile: Pick<UserProfile, 'active'> | null | undefined): boolean {
+  return !!profile && profile.active !== false;
 }
 
 export interface PipelineStage {
@@ -71,7 +87,12 @@ export interface Conversation {
   lastMessage: string;
   lastMessageAt: string;
   unreadCount: number;
-  assignedTo?: string;
+  assignedTo?: string | null;
+  assignedToName?: string | null;
+  /** Número de WhatsApp (instância Evolution) pelo qual esta conversa acontece */
+  instanceId?: string | null;
+  instanceLabel?: string | null;
+  lastMessageFromMe?: boolean;
   status: 'open' | 'closed' | 'archived';
   updatedAt: string;
 }
@@ -85,9 +106,44 @@ export interface Message {
   fromMe: boolean;
   body: string;
   status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
-  mediaType: 'text' | 'image' | 'audio' | 'document';
-  mediaUrl?: string;
+  mediaType: MediaType;
+  mediaUrl?: string | null;
+  mediaMime?: string | null;
+  fileName?: string | null;
+  /** Nome de quem enviou pelo CRM (mensagens fromMe) */
+  senderName?: string | null;
+  errorMessage?: string | null;
   timestamp: string;
+}
+
+export type MediaType = 'text' | 'image' | 'audio' | 'video' | 'document' | 'sticker';
+
+export type WhatsAppInstanceState = 'disconnected' | 'connecting' | 'connected' | 'error';
+
+/** Um número de WhatsApp conectado ao CRM (uma instância na Evolution API). */
+export interface WhatsAppInstance {
+  id: string; // igual ao nome da instância na Evolution API
+  label: string;
+  ownerId: string | null;
+  ownerName: string | null;
+  state: WhatsAppInstanceState;
+  phone?: string | null;
+  profileName?: string | null;
+  profilePicUrl?: string | null;
+  lastError?: string | null;
+  legacy?: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastEventAt?: string | null;
+}
+
+export interface QuickReply {
+  id: string;
+  title: string;
+  body: string;
+  createdBy: string;
+  createdByName: string;
+  createdAt: string;
 }
 
 export interface EvolutionConfigStatus {

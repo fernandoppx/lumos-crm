@@ -9,16 +9,17 @@ import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
   FirebaseUser,
-  testFirestoreConnection,
 } from '../lib/firebase.ts';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { UserProfile } from '../types/crm.ts';
+import { doc, getDoc, onSnapshot, runTransaction } from 'firebase/firestore';
+import { UserProfile, isProfileActive } from '../types/crm.ts';
 
 interface AuthContextType {
   user: FirebaseUser | null;
   profile: UserProfile | null;
   loading: boolean;
-  firestoreConnected: boolean;
+  isActive: boolean;
+  isAdmin: boolean;
+  isManager: boolean;
   signInWithGoogle: () => Promise<void>;
   signInWithEmail: (email: string, pass: string) => Promise<void>;
   signUpWithEmail: (name: string, email: string, pass: string) => Promise<void>;
@@ -27,97 +28,116 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+const BOOTSTRAP_DOC = () => doc(db, 'settings', 'bootstrap');
+
+/**
+ * Garante o perfil do usuário.
+ * - Se o sistema ainda não tem administrador, o usuário atual se torna o administrador (uma única vez).
+ * - Contas novas entram como "Vendedor" aguardando aprovação.
+ * - Contas antigas (sem o campo active) continuam funcionando.
+ */
+async function ensureProfile(currentUser: FirebaseUser, displayName?: string): Promise<void> {
+  const userRef = doc(db, 'users', currentUser.uid);
+  const name = displayName || currentUser.displayName || currentUser.email?.split('@')[0] || 'Usuário';
+
+  await runTransaction(db, async (tx) => {
+    const bootSnap = await tx.get(BOOTSTRAP_DOC());
+    const userSnap = await tx.get(userRef);
+    const now = new Date().toISOString();
+
+    if (!bootSnap.exists()) {
+      tx.set(BOOTSTRAP_DOC(), { adminUid: currentUser.uid, createdAt: now });
+      if (userSnap.exists()) {
+        tx.update(userRef, { role: 'admin', active: true });
+      } else {
+        tx.set(userRef, {
+          uid: currentUser.uid,
+          name,
+          email: currentUser.email || '',
+          role: 'admin',
+          active: true,
+          ...(currentUser.photoURL ? { avatarUrl: currentUser.photoURL } : {}),
+          createdAt: now,
+        });
+      }
+      return;
+    }
+
+    if (!userSnap.exists()) {
+      tx.set(userRef, {
+        uid: currentUser.uid,
+        name,
+        email: currentUser.email || '',
+        role: 'sales_rep',
+        active: false,
+        ...(currentUser.photoURL ? { avatarUrl: currentUser.photoURL } : {}),
+        createdAt: now,
+      });
+    }
+  });
+}
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
-  const [firestoreConnected, setFirestoreConnected] = useState(true);
 
   useEffect(() => {
-    testFirestoreConnection().then((connected) => {
-      setFirestoreConnected(connected);
-    });
+    let unsubProfile: (() => void) | null = null;
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setUser(currentUser);
-      if (currentUser) {
-        try {
-          const userDocRef = doc(db, 'users', currentUser.uid);
-          const docSnap = await getDoc(userDocRef);
-
-          if (docSnap.exists()) {
-            setProfile(docSnap.data() as UserProfile);
-          } else {
-            const newProfile: UserProfile = {
-              uid: currentUser.uid,
-              name: currentUser.displayName || currentUser.email?.split('@')[0] || 'Vendedor',
-              email: currentUser.email || '',
-              role: 'sales_rep',
-              avatarUrl: currentUser.photoURL || undefined,
-              createdAt: new Date().toISOString(),
-            };
-            await setDoc(userDocRef, newProfile);
-            setProfile(newProfile);
-          }
-        } catch (err) {
-          console.error('Erro ao sincronizar perfil de usuário:', err);
-          // Fallback de perfil temporário
-          setProfile({
-            uid: currentUser.uid,
-            name: currentUser.displayName || currentUser.email || 'Usuário',
-            email: currentUser.email || '',
-            role: 'sales_rep',
-            createdAt: new Date().toISOString(),
-          });
-        }
-      } else {
-        setProfile(null);
+      if (unsubProfile) {
+        unsubProfile();
+        unsubProfile = null;
       }
-      setLoading(false);
+      setUser(currentUser);
+      if (!currentUser) {
+        setProfile(null);
+        setLoading(false);
+        return;
+      }
+
+      try {
+        await ensureProfile(currentUser);
+      } catch (err) {
+        console.error('Erro ao preparar perfil:', err);
+      }
+
+      // Perfil em tempo real: aprovação ou mudança de papel aparece sem recarregar a página
+      unsubProfile = onSnapshot(
+        doc(db, 'users', currentUser.uid),
+        (snap) => {
+          setProfile(snap.exists() ? (snap.data() as UserProfile) : null);
+          setLoading(false);
+        },
+        async () => {
+          try {
+            const snap = await getDoc(doc(db, 'users', currentUser.uid));
+            setProfile(snap.exists() ? (snap.data() as UserProfile) : null);
+          } finally {
+            setLoading(false);
+          }
+        }
+      );
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      if (unsubProfile) unsubProfile();
+    };
   }, []);
 
   const handleSignInGoogle = async () => {
-    try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err: any) {
-      console.error('Erro no login com Google:', err);
-      throw err;
-    }
+    await signInWithPopup(auth, googleProvider);
   };
 
   const handleSignInEmail = async (email: string, pass: string) => {
-    try {
-      await signInWithEmailAndPassword(auth, email, pass);
-    } catch (err: any) {
-      if (err.code !== 'auth/invalid-credential' && err.code !== 'auth/wrong-password' && err.code !== 'auth/user-not-found') {
-        console.warn('Falha no login com E-mail:', err.message || err);
-      }
-      throw err;
-    }
+    await signInWithEmailAndPassword(auth, email, pass);
   };
 
   const handleSignUpEmail = async (name: string, email: string, pass: string) => {
-    try {
-      const res = await createUserWithEmailAndPassword(auth, email, pass);
-      const userDocRef = doc(db, 'users', res.user.uid);
-      const newProfile: UserProfile = {
-        uid: res.user.uid,
-        name,
-        email,
-        role: 'sales_rep',
-        createdAt: new Date().toISOString(),
-      };
-      await setDoc(userDocRef, newProfile);
-      setProfile(newProfile);
-    } catch (err: any) {
-      if (err.code !== 'auth/email-already-in-use' && err.code !== 'auth/weak-password') {
-        console.warn('Falha no cadastro com E-mail:', err.message || err);
-      }
-      throw err;
-    }
+    const res = await createUserWithEmailAndPassword(auth, email, pass);
+    await ensureProfile(res.user, name);
   };
 
   const handleLogout = async () => {
@@ -125,13 +145,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setProfile(null);
   };
 
+  const active = isProfileActive(profile);
+  const role = profile?.role || 'sales_rep';
+
   return (
     <AuthContext.Provider
       value={{
         user,
         profile,
         loading,
-        firestoreConnected,
+        isActive: active,
+        isAdmin: active && role === 'admin',
+        isManager: active && (role === 'admin' || role === 'manager'),
         signInWithGoogle: handleSignInGoogle,
         signInWithEmail: handleSignInEmail,
         signUpWithEmail: handleSignUpEmail,
