@@ -10,7 +10,7 @@
  */
 
 import crypto from 'crypto';
-import { getAdminFirestore, getAdminBucket, FieldValue } from './firebaseAdmin.ts';
+import { getAdminFirestore, uploadToStorage, FieldValue } from './firebaseAdmin.ts';
 import { normalizePhone, formatPhoneDisplay } from '../utils/formatters.ts';
 
 export type MediaKind = 'text' | 'image' | 'audio' | 'video' | 'document' | 'sticker';
@@ -240,17 +240,12 @@ export async function storeMediaFile(
     const clean = base64.replace(/^data:[^;]+;base64,/, '');
     const buffer = Buffer.from(clean, 'base64');
     if (!buffer.length || buffer.length > 20 * 1024 * 1024) return null;
-    const bucket = getAdminBucket();
     const path = `whatsapp-media/${folder}/${name.replace(/[^a-zA-Z0-9_.-]/g, '_')}.${extensionFor(mime, type)}`;
     const token = crypto.randomUUID();
-    await bucket.file(path).save(buffer, {
-      resumable: false,
-      metadata: {
-        contentType: (mime || 'application/octet-stream').split(';')[0],
-        metadata: { firebaseStorageDownloadTokens: token },
-      },
+    const { bucket } = await uploadToStorage(path, buffer, (mime || 'application/octet-stream').split(';')[0], {
+      firebaseStorageDownloadTokens: token,
     });
-    return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(path)}?alt=media&token=${token}`;
+    return `https://firebasestorage.googleapis.com/v0/b/${bucket}/o/${encodeURIComponent(path)}?alt=media&token=${token}`;
   } catch (err: any) {
     console.warn('[Media Storage Warning]:', err?.message || err);
     return null;

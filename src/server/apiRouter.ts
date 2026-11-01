@@ -17,7 +17,14 @@ import {
   mediaPlaceholder,
   InstanceRef,
 } from './webhookPersistence.ts';
-import { getAdminFirestore, getAdminAuth, hasServiceAccount } from './firebaseAdmin.ts';
+import {
+  getAdminFirestore,
+  getAdminAuth,
+  hasServiceAccount,
+  getCredentialMode,
+  describeVercelIdentity,
+  FieldValue,
+} from './firebaseAdmin.ts';
 
 export const apiRouter = Router();
 
@@ -112,6 +119,63 @@ function dbOrFail(res: Response) {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnóstico da conexão segura com o Google Cloud (somente administradores)
+// Grava, lê e apaga um documento numa coleção técnica isolada; nunca toca em dados de clientes.
+// ---------------------------------------------------------------------------
+
+apiRouter.post('/admin/gcp-auth-check', requireUser('admin'), async (_req: AuthedRequest, res: Response) => {
+  const startedAt = Date.now();
+  const steps: { step: string; ok: boolean; ms: number; detail?: string }[] = [];
+  const db = dbOrFail(res);
+  if (!db) return;
+
+  const run = async (step: string, fn: () => Promise<string | void>) => {
+    const t = Date.now();
+    try {
+      const detail = await fn();
+      steps.push({ step, ok: true, ms: Date.now() - t, ...(detail ? { detail } : {}) });
+      return true;
+    } catch (err: any) {
+      // Somente a mensagem: nunca tokens nem cabeçalhos
+      steps.push({ step, ok: false, ms: Date.now() - t, detail: String(err?.message || err).slice(0, 200) });
+      return false;
+    }
+  };
+
+  const id = `check_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const ref = db.collection('_system_healthchecks').doc(id);
+  const marker = Math.random().toString(36).slice(2);
+
+  await run('Firestore: leitura de perfil (já feita no login)', async () => 'ok');
+  const wrote = await run('Firestore: gravar documento de teste', async () => {
+    await ref.set({ marker, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString() });
+  });
+  if (wrote) {
+    await run('Firestore: ler documento de teste', async () => {
+      const snap = await ref.get();
+      if ((snap.data() as any)?.marker !== marker) throw new Error('Conteúdo lido diferente do gravado.');
+    });
+    await run('Firestore: atualizar documento de teste', async () => {
+      await ref.update({ checks: FieldValue.increment(1) });
+    });
+    await run('Firestore: apagar documento de teste', async () => {
+      await ref.delete();
+      if ((await ref.get()).exists) throw new Error('Documento de teste não foi apagado.');
+    });
+  }
+
+  const mode = getCredentialMode();
+  res.json({
+    ok: steps.every((s) => s.ok),
+    credentialMode: mode,
+    serviceAccount: process.env.GCP_SERVICE_ACCOUNT_EMAIL || null,
+    vercelIdentity: mode === 'workload_identity' ? await describeVercelIdentity() : null,
+    steps,
+    totalMs: Date.now() - startedAt,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Instâncias (números de WhatsApp)
 // ---------------------------------------------------------------------------
 
@@ -169,6 +233,7 @@ apiRouter.get('/config', requireUser('admin', 'manager'), (req: Request, res: Re
     evolutionConfigured: evolutionService.isConfigured(),
     evolutionUrlHint: process.env.EVOLUTION_API_URL ? `${process.env.EVOLUTION_API_URL.slice(0, 24)}…` : null,
     hasServiceAccount: hasServiceAccount(),
+    credentialMode: getCredentialMode(),
     webhookSecretSource: process.env.WEBHOOK_SECRET?.trim() ? 'WEBHOOK_SECRET' : getWebhookSecret() ? 'derivado da chave' : 'nenhum',
     appUrl: appUrl || null,
     appUrlFromEnv: Boolean(process.env.APP_URL?.trim()),

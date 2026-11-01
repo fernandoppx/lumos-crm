@@ -32,6 +32,7 @@ interface ConfigInfo {
   evolutionConfigured: boolean;
   evolutionUrlHint: string | null;
   hasServiceAccount: boolean;
+  credentialMode?: 'workload_identity' | 'service_account_key' | 'application_default' | 'none';
   webhookSecretSource: string;
   appUrl: string | null;
   appUrlFromEnv: boolean;
@@ -514,6 +515,7 @@ const DiagnosticsPanel: React.FC<{
   team: UserProfile[];
 }> = ({ config, configError, instances, team }) => {
   const { success, error } = useToast();
+  const { isAdmin: isAdminUser } = useAuth();
   const [logs, setLogs] = useState<any[]>([]);
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [importName, setImportName] = useState('');
@@ -535,6 +537,19 @@ const DiagnosticsPanel: React.FC<{
     loadLogs();
   }, []);
 
+  const [authCheck, setAuthCheck] = useState<any | null>(null);
+  const [checking, setChecking] = useState(false);
+  const runAuthCheck = async () => {
+    setChecking(true);
+    try {
+      setAuthCheck(await apiFetch('/api/admin/gcp-auth-check', { method: 'POST' }));
+    } catch (e: any) {
+      setAuthCheck({ ok: false, steps: [{ step: 'Chamada ao servidor', ok: false, detail: e.message }] });
+    } finally {
+      setChecking(false);
+    }
+  };
+
   const checks = config
     ? [
         {
@@ -543,9 +558,14 @@ const DiagnosticsPanel: React.FC<{
           detail: config.evolutionConfigured ? config.evolutionUrlHint || 'Configurado' : 'Defina EVOLUTION_API_URL e EVOLUTION_API_KEY na Vercel',
         },
         {
-          ok: config.hasServiceAccount,
+          ok: config.credentialMode === 'workload_identity',
           label: 'Acesso do servidor ao banco',
-          detail: config.hasServiceAccount ? 'Conta de serviço configurada' : 'Defina FIREBASE_SERVICE_ACCOUNT_KEY na Vercel',
+          detail:
+            config.credentialMode === 'workload_identity'
+              ? 'Workload Identity Federation (sem chave permanente)'
+              : config.credentialMode === 'service_account_key'
+                ? 'Usando chave JSON — troque por Workload Identity Federation'
+                : 'Configure as variáveis GCP_* do Workload Identity Federation na Vercel',
         },
         {
           ok: config.webhookSecretSource !== 'nenhum',
@@ -595,6 +615,34 @@ const DiagnosticsPanel: React.FC<{
               </span>
               <p className="font-mono break-all mt-0.5">{config.webhookUrl}</p>
               <p className="mt-1">Configurado automaticamente em cada número criado por aqui.</p>
+            </div>
+          )}
+
+          {isAdminUser && (
+            <div className="pt-3 border-t border-slate-100 space-y-2">
+              <button
+                onClick={runAuthCheck}
+                disabled={checking}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${checking ? 'animate-spin' : ''}`} /> Testar conexão segura com o banco
+              </button>
+              {authCheck && (
+                <div className={`p-2.5 rounded-lg border text-[11px] space-y-1 ${authCheck.ok ? 'bg-emerald-50 border-emerald-100 text-emerald-900' : 'bg-rose-50 border-rose-100 text-rose-900'}`}>
+                  <p className="font-semibold">{authCheck.ok ? 'Conexão segura funcionando' : 'Falha na conexão'}</p>
+                  {authCheck.vercelIdentity && (
+                    <p className="font-mono break-all">
+                      {authCheck.vercelIdentity.owner} / {authCheck.vercelIdentity.project} / {authCheck.vercelIdentity.environment}
+                    </p>
+                  )}
+                  {(authCheck.steps || []).map((s: any) => (
+                    <p key={s.step}>
+                      {s.ok ? '✓' : '✗'} {s.step}
+                      {s.detail && s.detail !== 'ok' ? ` — ${s.detail}` : ''}
+                    </p>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
