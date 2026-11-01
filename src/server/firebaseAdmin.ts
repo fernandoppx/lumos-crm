@@ -15,7 +15,7 @@
 
 import { initializeApp, getApps, cert, applicationDefault, App } from 'firebase-admin/app';
 import { getFirestore, Firestore, FieldValue } from 'firebase-admin/firestore';
-import { getAuth, Auth } from 'firebase-admin/auth';
+import { verifyFirebaseIdToken } from './verifyIdToken.ts';
 // google-auth-library e @vercel/oidc são carregados sob demanda (import dinâmico):
 // se faltarem no ambiente, só o acesso ao banco falha, nunca a API inteira.
 import firebaseConfig from '../../firebase-applet-config.json' with { type: 'json' };
@@ -211,9 +211,12 @@ export function getAdminFirestore(): { db: Firestore | null; error: string | nul
   }
 }
 
-/** A verificação do login (ID token) usa só as chaves públicas do Google e o Project ID. */
-export function getAdminAuth(): Auth {
-  return getAuth(getApp());
+/**
+ * Verificação do login (ID token do Firebase). Usa só os certificados públicos do Google;
+ * não precisa de credencial nem do firebase-admin/auth.
+ */
+export function getAdminAuth() {
+  return { verifyIdToken: (token: string) => verifyFirebaseIdToken(token, CRM_PROJECT_ID) };
 }
 
 /** Grava um arquivo no Firebase Storage e devolve o caminho e o bucket. */
