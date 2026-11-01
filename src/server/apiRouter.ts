@@ -23,6 +23,7 @@ import {
   hasServiceAccount,
   getCredentialMode,
   describeVercelIdentity,
+  ensureBackendReady,
   FieldValue,
 } from './firebaseAdmin.ts';
 
@@ -45,6 +46,18 @@ apiRouter.use((_req, res, next) => {
     };
   }
   next();
+});
+
+// Carrega as bibliotecas do Google antes das rotas que usam o banco (o /health não depende delas)
+apiRouter.use(async (req, res, next) => {
+  if ((req.url || '').split('?')[0].endsWith('/health')) return next();
+  try {
+    await ensureBackendReady();
+    next();
+  } catch (err: any) {
+    console.error('[Backend] Falha ao preparar o acesso ao Google Cloud:', err?.message || err);
+    res.status(503).json({ error: `Backend indisponível: ${String(err?.message || err).slice(0, 200)}` });
+  }
 });
 
 // ---------------------------------------------------------------------------

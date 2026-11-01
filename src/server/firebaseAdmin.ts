@@ -16,9 +16,8 @@
 import { initializeApp, getApps, cert, applicationDefault, App } from 'firebase-admin/app';
 import { getFirestore, Firestore, FieldValue } from 'firebase-admin/firestore';
 import { getAuth, Auth } from 'firebase-admin/auth';
-import { getStorage } from 'firebase-admin/storage';
-import { ExternalAccountClient } from 'google-auth-library';
-import { getVercelOidcToken } from '@vercel/oidc';
+// google-auth-library e @vercel/oidc são carregados sob demanda (import dinâmico):
+// se faltarem no ambiente, só o acesso ao banco falha, nunca a API inteira.
 import firebaseConfig from '../../firebase-applet-config.json' with { type: 'json' };
 
 export const CRM_PROJECT_ID = process.env.FIREBASE_PROJECT_ID?.trim() || firebaseConfig.projectId;
@@ -57,11 +56,18 @@ export function hasServiceAccount(): boolean {
 // Workload Identity Federation
 // ---------------------------------------------------------------------------
 
-let wifClient: ExternalAccountClient | null = null;
+let wifClient: any = null;
 
-function getWifClient(): ExternalAccountClient {
+async function loadOidc() {
+  const mod: any = await import('@vercel/oidc');
+  return mod.getVercelOidcToken as (o?: { audience?: string }) => Promise<string>;
+}
+
+async function getWifClient(): Promise<any> {
   if (wifClient) return wifClient;
   const env = wifEnv();
+  const { ExternalAccountClient } = (await import('google-auth-library')) as any;
+  const getVercelOidcToken = await loadOidc();
   const client = ExternalAccountClient.fromJSON({
     type: 'external_account',
     audience: `//iam.googleapis.com/projects/${env.projectNumber}/locations/global/workloadIdentityPools/${env.poolId}/providers/${env.providerId}`,
@@ -82,11 +88,19 @@ function getWifClient(): ExternalAccountClient {
   return client;
 }
 
+/**
+ * Prepara o backend antes de qualquer rota que usa o banco: carrega as bibliotecas do Google
+ * (import dinâmico) e cria o cliente federado. Chamado por um middleware da API.
+ */
+export async function ensureBackendReady(): Promise<void> {
+  if (getCredentialMode() === 'workload_identity') await getWifClient();
+}
+
 /** Credencial no formato que o firebase-admin espera, baseada no cliente federado. */
 function wifCredential() {
   return {
     async getAccessToken() {
-      const client = getWifClient();
+      const client = await getWifClient();
       const { token } = await client.getAccessToken();
       if (!token) throw new Error('O Google não devolveu um token de acesso.');
       const expiry = client.credentials?.expiry_date;
@@ -100,7 +114,7 @@ function wifCredential() {
 export async function getServiceAccessToken(): Promise<string> {
   const mode = getCredentialMode();
   if (mode === 'workload_identity') {
-    const { token } = await getWifClient().getAccessToken();
+    const { token } = await (await getWifClient()).getAccessToken();
     if (!token) throw new Error('O Google não devolveu um token de acesso.');
     return token;
   }
@@ -112,6 +126,7 @@ export async function getServiceAccessToken(): Promise<string> {
 /** Claims não sensíveis do token OIDC atual (para diagnóstico). Nunca devolve o token. */
 export async function describeVercelIdentity(): Promise<Record<string, string> | null> {
   try {
+    const getVercelOidcToken = await loadOidc();
     const token = await getVercelOidcToken();
     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
     return {
@@ -176,12 +191,13 @@ export function getAdminFirestore(): { db: Firestore | null; error: string | nul
   }
   try {
     if (mode === 'workload_identity') {
+      if (!wifClient) throw new Error('Autenticação federada ainda não inicializada.');
       // O firebase-admin só aceita chave JSON ou ADC no Firestore; com credencial federada
       // criamos o cliente diretamente, passando o cliente de autenticação.
       adminDbInstance = new Firestore({
         projectId: CRM_PROJECT_ID,
         databaseId: CRM_DATABASE_ID,
-        authClient: getWifClient(),
+        authClient: wifClient, // criado por ensureBackendReady()
         preferRest: true,
       } as any);
     } else {
@@ -202,13 +218,7 @@ export function getAdminAuth(): Auth {
 
 /** Grava um arquivo no Firebase Storage e devolve o caminho e o bucket. */
 export async function uploadToStorage(path: string, buffer: Buffer, contentType: string, metadata: Record<string, string>) {
-  if (getCredentialMode() !== 'workload_identity') {
-    const bucket = getStorage(getApp()).bucket(CRM_STORAGE_BUCKET);
-    await bucket.file(path).save(buffer, { resumable: false, metadata: { contentType, metadata } });
-    return { bucket: bucket.name };
-  }
-
-  // Com credencial federada usamos a API JSON do Cloud Storage (upload multipart).
+  // API JSON do Cloud Storage (upload multipart), sem depender de @google-cloud/storage.
   const token = await getServiceAccessToken();
   const boundary = `lumos${Date.now().toString(36)}`;
   const meta = JSON.stringify({ name: path, contentType, metadata });
